@@ -4,9 +4,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { createInitialSystemMessage, type Message, type Tool, type TranscriptContext } from "@earendil-works/pi-ai";
-import { createAgyAcpProvider, type PersistedAcpBinding } from "../src/provider.ts";
+import { createAgyAcpProvider, type AgyAcpProviderHandle, type PersistedAcpBinding } from "../src/provider.ts";
 
 const LIVE = process.env.PI_AGY_ACP_LIVE === "1";
+
+function liveRequest(handle: AgyAcpProviderHandle, signal = new AbortController().signal) {
+	handle.expectLiveRequest(signal);
+	return { signal, onProviderStreamEvent: () => {}, sessionId: "live-pi-1", reasoning: "low" as const };
+}
 
 function makeContext(systemPrompt: string, tools: Tool[], messages: Message[]): TranscriptContext {
 	const sys = createInitialSystemMessage(systemPrompt, tools);
@@ -59,10 +64,8 @@ test(
 				timestamp: Date.now(),
 			};
 
-			const s1 = handle1.provider.streamSimple(flash, makeContext(sysPrompt, [codemodeTool], [user1]), {
-				sessionId: "live-pi-1",
-				reasoning: "low",
-			});
+			const signal = new AbortController().signal;
+			const s1 = handle1.provider.streamSimple(flash, makeContext(sysPrompt, [codemodeTool], [user1]), liveRequest(handle1, signal));
 			const m1 = await s1.result();
 			assert.equal(m1.stopReason, "toolUse", `expected toolUse, got ${m1.stopReason}: ${m1.errorMessage ?? ""}`);
 			const call = m1.content.find((b) => b.type === "toolCall");
@@ -78,10 +81,7 @@ test(
 				timestamp: Date.now(),
 			};
 
-			const s2 = handle1.provider.streamSimple(flash, makeContext(sysPrompt, [codemodeTool], [user1, m1, tr1]), {
-				sessionId: "live-pi-1",
-				reasoning: "low",
-			});
+			const s2 = handle1.provider.streamSimple(flash, makeContext(sysPrompt, [codemodeTool], [user1, m1, tr1]), liveRequest(handle1, signal));
 			const m2 = await s2.result();
 			assert.equal(m2.stopReason, "stop");
 			const text2 = m2.content.filter((b) => b.type === "text").map((b) => b.text).join("");
@@ -103,7 +103,7 @@ test(
 				const s3 = handle2.provider.streamSimple(
 					flash,
 					makeContext(sysPrompt, [codemodeTool], [user1, m1, tr1, m2, user2]),
-					{ sessionId: "live-pi-1", reasoning: "low" },
+					liveRequest(handle2),
 				);
 				const m3 = await s3.result();
 				assert.equal(m3.stopReason, "stop");

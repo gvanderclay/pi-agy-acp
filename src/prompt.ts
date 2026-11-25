@@ -9,13 +9,14 @@ import {
 	getSystemMessageText,
 	type ImageContent,
 	type Message,
+	type SystemMessage,
 	type TextContent,
 	type ToolResultMessage,
 	type UserMessage,
 } from "@earendil-works/pi-ai";
 import type { AcpPromptBlock } from "./acp-wire.ts";
 
-export function hashText(text: string): string {
+function hashText(text: string): string {
 	return createHash("sha256").update(text).digest("hex").slice(0, 16);
 }
 
@@ -68,12 +69,14 @@ export function fingerprintMessages(messages: readonly Message[]): string {
 	return `m${count}-${hash.digest("hex").slice(0, 16)}`;
 }
 
-/** Non-system messages preceding the newest user message (for warm-resume validation). */
-export function prefixBeforeLatestUser(messages: readonly Message[]): Message[] {
-	const nonSystem = messages.filter((m) => m.role !== "system");
-	const lastUserIdx = nonSystem.findLastIndex((m) => m.role === "user");
-	if (lastUserIdx <= 0) return [];
-	return nonSystem.slice(0, lastUserIdx);
+/** Returns the unsent tail, or null if the ACP session's prefix no longer matches. */
+export function messagesAfterFingerprint(messages: readonly Message[], fingerprint: string): Message[] | null {
+	const match = /^m(\d+)-[0-9a-f]{16}$/.exec(fingerprint);
+	if (!match) return null;
+	const count = Number(match[1]);
+	const conversation = messages.filter((message) => message.role !== "system");
+	if (count > conversation.length || fingerprintMessages(conversation.slice(0, count)) !== fingerprint) return null;
+	return conversation.slice(count);
 }
 
 /** Converts a Pi `UserMessage` into ACP `session/prompt` content blocks (text + images). */
@@ -90,14 +93,6 @@ export function userMessageToPromptBlocks(message: UserMessage): AcpPromptBlock[
 		}
 	}
 	return blocks;
-}
-
-/** Extracts ACP prompt blocks from the newest user message in the transcript. */
-export function extractLatestUserPrompt(messages: readonly Message[]): AcpPromptBlock[] | null {
-	const latest = messages.findLast((m): m is UserMessage => m.role === "user");
-	if (!latest) return null;
-	const blocks = userMessageToPromptBlocks(latest);
-	return blocks.length > 0 ? blocks : null;
 }
 
 function renderContentParts(parts: readonly (TextContent | ImageContent)[]): string {
@@ -118,16 +113,25 @@ function renderContentParts(parts: readonly (TextContent | ImageContent)[]): str
  */
 export function renderTranscriptReplay(messages: readonly Message[]): AcpPromptBlock[] | null {
 	const nonSystem = messages.filter((m) => m.role !== "system");
-	if (nonSystem.length === 0) return null;
+	const lastMsg = nonSystem.at(-1);
+	const latestUser = lastMsg?.role === "user" ? lastMsg : undefined;
+	const prior = latestUser ? nonSystem.slice(0, -1) : nonSystem;
+	return renderTranscriptPrompt(prior, latestUser, "conversation_history");
+}
 
-	// Single user message at start of session: send directly without history wrapper.
-	if (nonSystem.length === 1 && nonSystem[0].role === "user") {
-		const blocks = userMessageToPromptBlocks(nonSystem[0]);
-		return blocks.length > 0 ? blocks : null;
-	}
+/** Sends only conversation messages missing from a warm ACP session. */
+export function renderTranscriptDelta(messages: readonly Message[]): AcpPromptBlock[] | null {
+	const latestUserIndex = messages.findLastIndex((message) => message.role === "user");
+	const latestUser = messages[latestUserIndex];
+	const prior = messages.filter((_, index) => index !== latestUserIndex);
+	return renderTranscriptPrompt(prior, latestUser?.role === "user" ? latestUser : undefined, "conversation_context");
+}
 
-	const lastMsg = nonSystem[nonSystem.length - 1];
-	const prior = lastMsg.role === "user" ? nonSystem.slice(0, -1) : nonSystem;
+function renderTranscriptPrompt(
+	prior: readonly Message[],
+	latestUser: UserMessage | undefined,
+	contextTag: "conversation_history" | "conversation_context",
+): AcpPromptBlock[] | null {
 	const historyLines: string[] = [];
 
 	for (const msg of prior) {
@@ -155,13 +159,11 @@ export function renderTranscriptReplay(messages: readonly Message[]): AcpPromptB
 	if (historyLines.length > 0) {
 		blocks.push({
 			type: "text",
-			text: `<conversation_history>\n${historyLines.join("\n\n")}\n</conversation_history>`,
+			text: `<${contextTag}>\n${historyLines.join("\n\n")}\n</${contextTag}>`,
 		});
 	}
 
-	if (lastMsg.role === "user") {
-		blocks.push(...userMessageToPromptBlocks(lastMsg));
-	}
+	if (latestUser) blocks.push(...userMessageToPromptBlocks(latestUser));
 
 	return blocks.length > 0 ? blocks : null;
 }
@@ -243,8 +245,19 @@ function systemContentText(content: string | TextContent[]): string {
  */
 export function renderSystemPromptAppend(messages: readonly Message[], log?: (message: string) => void): string {
 	const sys = getCurrentSystemMessage(messages);
-	if (!sys) return "";
+	return sys ? renderSystemAppend(sys, log) : "";
+}
 
+export function hashSystemPromptAppend(messages: readonly Message[]): string {
+	const sys = getCurrentSystemMessage(messages);
+	if (!sys) return hashText("");
+
+	// ACP learns tool changes independently via MCP notifications/tools/list_changed.
+	const { tools: _tools, ...sections } = sys.sections ?? {};
+	return hashText(renderSystemAppend({ ...sys, sections: Object.keys(sections).length > 0 ? sections : undefined }));
+}
+
+function renderSystemAppend(sys: SystemMessage, log?: (message: string) => void): string {
 	const sections = sys.sections;
 	if (sections) {
 		const preamble = sections.preamble;

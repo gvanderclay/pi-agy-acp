@@ -3,11 +3,12 @@ import { test } from "node:test";
 import type { AssistantMessage, Message, ToolResultMessage, UserMessage } from "@earendil-works/pi-ai";
 import {
 	_resetSystemPromptWarnings,
-	extractLatestUserPrompt,
 	extractPostAssistantTail,
 	fingerprintMessages,
-	prefixBeforeLatestUser,
+	hashSystemPromptAppend,
+	messagesAfterFingerprint,
 	renderSystemPromptAppend,
+	renderTranscriptDelta,
 	renderTranscriptReplay,
 } from "../src/prompt.ts";
 
@@ -36,7 +37,7 @@ test("fingerprintMessages ignores thinking blocks and system messages", () => {
 	);
 });
 
-test("extractLatestUserPrompt forwards text and image blocks", () => {
+test("renderTranscriptDelta forwards a lone user prompt as text and image blocks", () => {
 	const messages: Message[] = [
 		{
 			role: "user",
@@ -47,7 +48,7 @@ test("extractLatestUserPrompt forwards text and image blocks", () => {
 			timestamp: 1,
 		},
 	];
-	assert.deepEqual(extractLatestUserPrompt(messages), [
+	assert.deepEqual(renderTranscriptDelta(messages), [
 		{ type: "text", text: "look at this" },
 		{ type: "image", data: "AAAA", mimeType: "image/png" },
 	]);
@@ -72,7 +73,42 @@ test("renderTranscriptReplay wraps prior turns and preserves latest user images"
 	assert.match((blocks[0] as { type: "text"; text: string }).text, /<conversation_history>/);
 	assert.deepEqual(blocks[1], { type: "text", text: "second" });
 	assert.deepEqual(blocks[2], { type: "image", data: "BBBB", mimeType: "image/png" });
-	assert.equal(prefixBeforeLatestUser(messages).length, 2);
+});
+
+test("a matched conversation prefix sends an unsent tool result and preserves the next user's attachments", () => {
+	const oldUser: UserMessage = { role: "user", content: "old request", timestamp: 1 };
+	const oldAssistant = makeAssistant("old reply");
+	const seen = fingerprintMessages([oldUser, oldAssistant]);
+	const messages: Message[] = [
+		{ role: "system", content: "sys", timestamp: 0 },
+		oldUser,
+		oldAssistant,
+		{
+			role: "toolResult",
+			toolCallId: "call-1",
+			toolName: "lookup",
+			content: [{ type: "text", text: "new result" }],
+			isError: false,
+			timestamp: 2,
+		},
+		{
+			role: "user",
+			content: [
+				{ type: "text", text: "next request" },
+				{ type: "image", mimeType: "image/png", data: "AAAA" },
+			],
+			timestamp: 3,
+		},
+	];
+	const delta = messagesAfterFingerprint(messages, seen);
+	assert.ok(delta);
+	const blocks = renderTranscriptDelta(delta);
+	assert.ok(blocks);
+	assert.deepEqual(blocks, [
+		{ type: "text", text: "<conversation_context>\n[Tool result lookup (ok)]:\nnew result\n</conversation_context>" },
+		{ type: "text", text: "next request" },
+		{ type: "image", mimeType: "image/png", data: "AAAA" },
+	]);
 });
 
 test("extractPostAssistantTail collects toolResults and trailing user steering", () => {
@@ -147,6 +183,26 @@ test("renderSystemPromptAppend preserves custom --system-prompt and forced promp
 		{ role: "system", content: "Summarize this conversation.", timestamp: 0 },
 	];
 	assert.equal(renderSystemPromptAppend(forcedMessages), "Summarize this conversation.");
+});
+
+test("append continuity includes custom prompt text and non-tool sections", () => {
+	const system: Message = {
+		role: "system",
+		content: "Custom instructions with a literal <tools>example</tools>.",
+		sections: { tools: "Pi tool documentation", project_context: "Project A", extra: "Extension A" },
+		timestamp: 0,
+	};
+	const hash = hashSystemPromptAppend([system]);
+	assert.equal(hashSystemPromptAppend([system, {
+		role: "system", content: "", sections: { tools: null }, timestamp: 1,
+	}]), hash);
+	assert.notEqual(hashSystemPromptAppend([{ ...system, content: "Custom instructions with a literal <tools>edit</tools>." }]), hash);
+	assert.notEqual(hashSystemPromptAppend([system, {
+		role: "system", content: "", sections: { project_context: "Project B" }, timestamp: 1,
+	}]), hash);
+	assert.notEqual(hashSystemPromptAppend([system, {
+		role: "system", content: "", sections: { extra: "Extension B" }, timestamp: 1,
+	}]), hash);
 });
 
 test("renderSystemPromptAppend warns once on unrecognized preamble alongside Pi built-in sections", () => {

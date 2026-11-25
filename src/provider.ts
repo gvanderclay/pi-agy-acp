@@ -34,12 +34,12 @@ import {
 } from "./acp-wire.ts";
 import { McpBridgeServer, type ParkedToolCall } from "./mcp-server.ts";
 import {
-	extractLatestUserPrompt,
 	extractPostAssistantTail,
 	fingerprintMessages,
-	hashText,
-	prefixBeforeLatestUser,
+	hashSystemPromptAppend,
+	messagesAfterFingerprint,
 	renderSystemPromptAppend,
+	renderTranscriptDelta,
 	renderTranscriptReplay,
 } from "./prompt.ts";
 import { projectPiTools } from "./tools.ts";
@@ -83,6 +83,7 @@ export interface AgyAcpProviderHandle {
 	provider: Provider<typeof AGY_ACP_API>;
 	/** Updates active Pi session context (called on `session_start` and `session_tree`). */
 	syncSession(ctx: SessionSyncContext): void;
+	expectLiveRequest(signal: AbortSignal | undefined): void;
 	/** Invalidates live ACP session continuity (called on `session_compact`). */
 	invalidateSession(reason?: string): void;
 	/** Cancels any parked MCP tool calls if Pi exits the agent loop without resuming. */
@@ -440,6 +441,7 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 
 	let models: Model<typeof AGY_ACP_API>[] = [...BASELINE_MODELS];
 	let activePiSessionId: string | undefined;
+	let pendingLiveSignal: AbortSignal | undefined;
 	let activeCwd = process.cwd();
 	let persistedBinding: PersistedAcpBinding | undefined;
 	let boundSession: BoundSession | null = null;
@@ -497,10 +499,21 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 		return auxTransport;
 	};
 
-	const isAuxiliaryCall = (streamOptions: StreamOptions | undefined): boolean => {
-		if (streamOptions?.disableContinuation) return true;
-		if (activePiSessionId !== undefined && streamOptions?.sessionId !== activePiSessionId) return true;
-		return false;
+	const takeLiveRequest = (streamOptions: StreamOptions | undefined): boolean => {
+		// Pi 1.6.0 dist/core/sdk.js installs this observer on the agent loop.
+		// A nested streamSimple call can share both ctx.signal and sessionId.
+		if (
+			!pendingLiveSignal ||
+			!activePiSessionId ||
+			streamOptions?.signal !== pendingLiveSignal ||
+			streamOptions.sessionId !== activePiSessionId ||
+			!streamOptions.onProviderStreamEvent ||
+			streamOptions.disableContinuation
+		) {
+			return false;
+		}
+		pendingLiveSignal = undefined;
+		return true;
 	};
 
 	const clearBridge = (bridge: ActiveBridge, cancelRemote: boolean, reason: string): void => {
@@ -530,6 +543,7 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 	};
 
 	const abandonParkedTurn = (reason = "Pi ended the turn before tool results were delivered."): void => {
+		pendingLiveSignal = undefined;
 		if (!activeBridge) return;
 		const bridge = activeBridge;
 		const resolve = bridge.phaseResolve;
@@ -712,6 +726,7 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 				| undefined;
 			const finalPrompt = rewritten?.prompt ?? promptBlocks;
 
+			log(`aux full transcript replay: standalone request sid=${sessionId}`);
 			const result = await transport.prompt({
 				sessionId,
 				prompt: finalPrompt,
@@ -729,6 +744,7 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 					else if (update.type === "agent_thought_chunk") writer.append("thinking", update.text);
 				},
 			});
+			log(`aux raw ACP usage sid=${sessionId}: ${JSON.stringify(result.usage ?? null)}`);
 			message.usage = normalizeTurnUsage(model, result.usage, latestUsageUpdate, 1);
 			finishFromStopReason(writer, result.stopReason);
 		} catch (error) {
@@ -824,8 +840,7 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 
 		// Case 2: Start a fresh ACP prompt turn (reusing/resuming warm session if continuity matches).
 		const systemPrompt = renderSystemPromptAppend(context.messages, log);
-		const systemPromptHash = hashText(systemPrompt);
-		const prefixFingerprint = fingerprintMessages(prefixBeforeLatestUser(context.messages));
+		const systemPromptHash = hashSystemPromptAppend(context.messages);
 		const projectedTools = projectPiTools(getCurrentTools(context.messages));
 
 		let transport: AcpTransport;
@@ -839,52 +854,48 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 			return;
 		}
 
-		// Try to reuse in-memory bound session or resume persisted session across restart/reload.
-		let useDeltaPrompt = false;
+		const binding = boundSession ?? (persistedBinding?.piSessionId === activePiSessionId ? persistedBinding : undefined);
+		let delta = binding?.cwd === activeCwd ? messagesAfterFingerprint(context.messages, binding.syncedFingerprint) : null;
+		let session = delta !== null ? boundSession : null;
+		let replayReason = !binding
+			? "cold start (no ACP session)"
+			: binding.cwd !== activeCwd ? "working directory changed" : "diverged prefix";
 		let needApplySettings = false;
 		let sessionId: string;
 
 		try {
-			if (
-				!boundSession &&
-				persistedBinding &&
-				persistedBinding.piSessionId === activePiSessionId &&
-				persistedBinding.cwd === activeCwd &&
-				persistedBinding.systemPromptHash === systemPromptHash &&
-				persistedBinding.syncedFingerprint === prefixFingerprint
-			) {
+			// An append changed during a parked turn is applied here, after that ACP prompt finishes.
+			if (delta !== null && binding && (!session || session.systemPromptHash !== systemPromptHash)) {
 				try {
 					await transport.resumeSession({
-						sessionId: persistedBinding.acpSessionId,
+						sessionId: binding.acpSessionId,
 						cwd: activeCwd,
-						systemPromptAppend: systemPrompt || undefined,
+						systemPromptAppend: systemPrompt,
 						signal,
 					});
-					boundSession = {
-						acpSessionId: persistedBinding.acpSessionId,
+					session = {
+						acpSessionId: binding.acpSessionId,
 						cwd: activeCwd,
 						systemPromptHash,
-						syncedFingerprint: prefixFingerprint,
-						// `agy acp` resets model to default on `session/resume`, so force re-applying.
+						syncedFingerprint: binding.syncedFingerprint,
 						lastModelId: undefined,
 						lastThoughtLevel: undefined,
 					};
+					// agy resets the model on session/resume.
 					needApplySettings = true;
 				} catch (error) {
-					log(`session/resume failed, falling back to fresh session: ${errorMessage(error)}`);
-					persistedBinding = undefined;
+					if (session) {
+						log(`main session/resume failed sid=${session.acpSessionId}; keeping previous system append: ${errorMessage(error)}`);
+					} else {
+						log(`main session/resume failed sid=${binding.acpSessionId}: ${errorMessage(error)}`);
+						replayReason = "session/resume failed";
+					}
 				}
 			}
 
-			if (
-				boundSession &&
-				boundSession.cwd === activeCwd &&
-				boundSession.systemPromptHash === systemPromptHash &&
-				boundSession.syncedFingerprint === prefixFingerprint
-			) {
-				sessionId = boundSession.acpSessionId;
-				useDeltaPrompt = true;
-			} else {
+			if (!session) {
+				delta = null;
+				persistedBinding = undefined;
 				if (boundSession) {
 					await transport.closeSession(boundSession.acpSessionId);
 					boundSession = null;
@@ -896,9 +907,8 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 					signal,
 				});
 				log(`main createSession ok sid=${created.sessionId}`);
-				sessionId = created.sessionId;
-				boundSession = {
-					acpSessionId: sessionId,
+				session = {
+					acpSessionId: created.sessionId,
 					cwd: activeCwd,
 					systemPromptHash,
 					syncedFingerprint: "",
@@ -908,6 +918,8 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 				needApplySettings = true;
 			}
 
+			boundSession = session;
+			sessionId = session.acpSessionId;
 			const reasoning = (streamOptions as SimpleStreamOptions | undefined)?.reasoning;
 			const applied = await applySessionModelAndThinking(
 				transport,
@@ -915,25 +927,27 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 				model,
 				reasoning,
 				needApplySettings,
-				boundSession.lastModelId,
-				boundSession.lastThoughtLevel,
+				session.lastModelId,
+				session.lastThoughtLevel,
 				signal,
 			);
 			log(`main applied model=${applied.modelId} thought=${applied.thoughtLevel}`);
-			boundSession.lastModelId = applied.modelId;
-			boundSession.lastThoughtLevel = applied.thoughtLevel;
+			session.lastModelId = applied.modelId;
+			session.lastThoughtLevel = applied.thoughtLevel;
 		} catch (error) {
 			if (signal?.aborted) writer.fail("aborted", "Request was aborted");
 			else writer.fail("error", errorMessage(error));
 			return;
 		}
 
-		const promptBlocks = useDeltaPrompt
-			? extractLatestUserPrompt(context.messages)
-			: renderTranscriptReplay(context.messages);
+		const promptBlocks: AcpPromptBlock[] | null = delta === null
+			? renderTranscriptReplay(context.messages)
+			: delta.length === 0
+				? [{ type: "text", text: "Continue the conversation." }]
+				: renderTranscriptDelta(delta);
 
 		if (!promptBlocks || promptBlocks.length === 0) {
-			writer.fail("error", "No user prompt content found to send to Antigravity ACP.");
+			writer.fail("error", "No prompt content found to send to Antigravity ACP.");
 			return;
 		}
 
@@ -955,7 +969,7 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 			sessionId,
 			model,
 			cwd: activeCwd,
-			systemPromptHash,
+			systemPromptHash: session.systemPromptHash,
 			writer,
 			onRawUpdate,
 			detachSignal: null,
@@ -992,7 +1006,8 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 		);
 
 		const phasePromise = awaitBridgePhase(bridge);
-		log(`main prompt sending sid=${sessionId} delta=${useDeltaPrompt} blocks=${finalPrompt.length}`);
+		if (delta === null) log(`main full transcript replay: ${replayReason} sid=${sessionId}`);
+		log(`main prompt sending sid=${sessionId} delta=${delta !== null} blocks=${finalPrompt.length}`);
 
 		void transport
 			.prompt({
@@ -1003,6 +1018,7 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 			})
 			.then(
 				(result) => {
+					log(`main raw ACP usage sid=${sessionId}: ${JSON.stringify(result.usage ?? null)}`);
 					if (bridge.aborted) return;
 					const resolve = bridge.phaseResolve;
 					bridge.phaseResolve = null;
@@ -1030,7 +1046,7 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 		streamOptions?: StreamOptions,
 	): AssistantMessageEventStream => {
 		const events = createAssistantMessageEventStream();
-		const aux = isAuxiliaryCall(streamOptions);
+		const aux = !takeLiveRequest(streamOptions);
 		log(`stream start aux=${aux} model=${model.id} optSid=${streamOptions?.sessionId ?? "none"} activeSid=${activePiSessionId ?? "none"} msgs=${context.messages.length}`);
 		const runner = aux
 			? runAuxiliaryTurn(events, model, context, streamOptions)
@@ -1115,6 +1131,9 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 			}
 			boundSession = null;
 			persistedBinding = ctx.persistedBinding;
+		},
+		expectLiveRequest(signal: AbortSignal | undefined): void {
+			pendingLiveSignal = signal;
 		},
 		invalidateSession(reason?: string): void {
 			abandonParkedTurn(reason ? `Session invalidated: ${reason}` : "Session invalidated.");

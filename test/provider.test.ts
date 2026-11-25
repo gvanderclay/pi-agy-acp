@@ -4,6 +4,8 @@ import {
 	createInitialSystemMessage,
 	type AssistantMessage,
 	type Message,
+	type StreamOptions,
+	type SystemMessage,
 	type Tool,
 	type TranscriptContext,
 } from "@earendil-works/pi-ai";
@@ -21,12 +23,20 @@ import {
 	createAgyAcpProvider,
 	modelsFromSessionConfig,
 	normalizeTurnUsage,
+	type AgyAcpProviderHandle,
 	type PersistedAcpBinding,
 } from "../src/provider.ts";
 
-function makeContext(systemPrompt: string, tools: Tool[], messages: Message[]): TranscriptContext {
-	const sys = createInitialSystemMessage(systemPrompt, tools);
+function makeContext(systemPrompt: string | SystemMessage, tools: Tool[], messages: Message[]): TranscriptContext {
+	const sys = typeof systemPrompt === "string" ? createInitialSystemMessage(systemPrompt, tools) : systemPrompt;
 	return { messages: sys ? [sys, ...messages] : [...messages] } as TranscriptContext;
+}
+
+const providerStreamObserver: NonNullable<StreamOptions["onProviderStreamEvent"]> = () => {};
+
+function liveRequest(handle: AgyAcpProviderHandle, signal = new AbortController().signal) {
+	handle.expectLiveRequest(signal);
+	return { signal, onProviderStreamEvent: providerStreamObserver };
 }
 
 function makeMockConfig(): AcpSessionConfig {
@@ -73,6 +83,7 @@ class MockAcpTransport implements AcpTransport {
 	readonly configCalls: Array<{ sessionId: string; configId: string; value: string }> = [];
 	readonly cancelledSessions: string[] = [];
 	readonly prompts: AcpPromptCall[] = [];
+	resumeError?: Error;
 	disposed = false;
 	private seq = 0;
 	private configs = new Map<string, AcpSessionConfig>();
@@ -103,6 +114,7 @@ class MockAcpTransport implements AcpTransport {
 
 	async resumeSession(options: AcpSessionResumeOptions) {
 		this.resumedSessions.push(options);
+		if (this.resumeError) throw this.resumeError;
 		const config = makeMockConfig();
 		this.configs.set(options.sessionId, config);
 		return { sessionId: options.sessionId, config };
@@ -173,7 +185,7 @@ test("normalizeTurnUsage scales multi-step cumulative usage to final context occ
 	assert.equal(normalized.totalTokens, 10200);
 });
 
-test("provider executes full parked Pi tool loop with steering, usage, and session/resume across restart", async () => {
+test("same-session extension call leaves the live ACP turn parked and subsequent turns use only the delta", async () => {
 	const mainTransport = new MockAcpTransport();
 	const auxTransport = new MockAcpTransport();
 	let mcpEndpoint: { url: string; token: string } | undefined;
@@ -229,12 +241,19 @@ test("provider executes full parked Pi tool loop with steering, usage, and sessi
 		handle.syncSession({ piSessionId: "pi-1", cwd: "/work" });
 		const model = handle.provider.getModels().find((m) => m.id === "gemini-3.8-flash")!;
 		const user1: Message = { role: "user", content: "compute 21*2", timestamp: 1 };
+		const signal = new AbortController().signal;
+		const liveOptions = { ...liveRequest(handle, signal), sessionId: "pi-1", reasoning: "low" as const };
+		const auxContext = makeContext("Summarize", [], [{ role: "user", content: "summarize this", timestamp: 4 }]);
+
+		const beforeLive = handle.provider.streamSimple(model, auxContext, { signal, sessionId: "pi-1" });
+		assert.equal((await beforeLive.result()).stopReason, "stop");
+		assert.equal(mainTransport.createdSessions.length, 0);
 
 		// Phase 1: Pi receives stopReason: "toolUse" + toolCall
 		const stream1 = handle.provider.streamSimple(
 			model,
 			makeContext("Be helpful.", [codemodeTool], [user1]),
-			{ sessionId: "pi-1", reasoning: "low" },
+			liveOptions,
 		);
 		const msg1: AssistantMessage = await stream1.result();
 		assert.equal(msg1.stopReason, "toolUse");
@@ -242,6 +261,14 @@ test("provider executes full parked Pi tool loop with steering, usage, and sessi
 		assert.ok(toolCall && toolCall.type === "toolCall");
 		assert.equal(toolCall.name, "codemode");
 		assert.deepEqual(toolCall.arguments, { code: "return 21 * 2" });
+
+		const auxStream = handle.provider.streamSimple(model, auxContext, { ...liveOptions });
+		assert.equal((await auxStream.result()).stopReason, "stop");
+		assert.deepEqual(mainTransport.cancelledSessions, []);
+		assert.equal(mainTransport.createdSessions.length, 1);
+		assert.equal(auxTransport.createdSessions.length, 2);
+		assert.equal(auxTransport.closedSessions.length, 2);
+		assert.equal(bindings.length, 0);
 
 		// Phase 2: Pi executes tool, appends toolResult + user steering, calls streamSimple again
 		const toolRes: Message = {
@@ -256,8 +283,8 @@ test("provider executes full parked Pi tool loop with steering, usage, and sessi
 
 		const stream2 = handle.provider.streamSimple(
 			model,
-			makeContext("Be helpful.", [codemodeTool], [user1, msg1, toolRes, steer]),
-			{ sessionId: "pi-1", reasoning: "low" },
+			makeContext("Be helpful. Tools changed.", [codemodeTool], [user1, msg1, toolRes, steer]),
+			{ ...liveRequest(handle, signal), sessionId: "pi-1", reasoning: "low" },
 		);
 		const msg2: AssistantMessage = await stream2.result();
 		assert.equal(msg2.stopReason, "stop");
@@ -272,17 +299,26 @@ test("provider executes full parked Pi tool loop with steering, usage, and sessi
 		assert.equal(mcpContent[0].text, "42");
 		assert.match(mcpContent[1].text, /keep it brief/);
 
-		// Auxiliary call (e.g. handoff-lite with fresh sessionId) uses auxTransport, NOT mainTransport!
-		const auxStream = handle.provider.streamSimple(
+		assert.equal(mainTransport.prompts.length, 1);
+		assert.deepEqual(mainTransport.resumedSessions, []);
+		mainTransport.promptImpl = async (req) => {
+			req.onUpdate({ type: "agent_message_chunk", text: "Still warm" });
+			return { stopReason: "end_turn", usage: undefined };
+		};
+		const user2: Message = { role: "user", content: "follow-up", timestamp: 5 };
+		const msg3 = await handle.provider.streamSimple(
 			model,
-			makeContext("Summarize", [], [{ role: "user", content: "summarize this", timestamp: 4 }]),
-			{ sessionId: "other-session-uuid", disableContinuation: true },
-		);
-		const auxMsg = await auxStream.result();
-		assert.equal(auxMsg.stopReason, "stop");
-		assert.equal(auxTransport.createdSessions.length, 1);
-		assert.equal(auxTransport.closedSessions.length, 1);
+			makeContext("Be helpful. Tools changed.", [codemodeTool], [user1, msg1, toolRes, steer, msg2, user2]),
+			{ ...liveRequest(handle), sessionId: "pi-1", reasoning: "low" },
+		).result();
+		assert.equal(msg3.stopReason, "stop");
 		assert.equal(mainTransport.createdSessions.length, 1);
+		assert.equal(mainTransport.prompts[1].sessionId, mainTransport.prompts[0].sessionId);
+		assert.deepEqual(
+			mainTransport.resumedSessions.map(({ sessionId, systemPromptAppend }) => ({ sessionId, systemPromptAppend })),
+			[{ sessionId: mainTransport.prompts[0].sessionId, systemPromptAppend: "Be helpful. Tools changed." }],
+		);
+		assert.deepEqual(mainTransport.prompts[1].prompt, [{ type: "text", text: "follow-up" }]);
 
 		// Simulate Pi restart: a fresh provider instance receives the persisted binding -> resumes via session/resume!
 		const mainTransport2 = new MockAcpTransport();
@@ -300,17 +336,17 @@ test("provider executes full parked Pi tool loop with steering, usage, and sessi
 			createMainTransport: () => mainTransport2,
 		});
 		try {
-			handle2.syncSession({ piSessionId: "pi-1", cwd: "/work", persistedBinding: bindings[0] });
-			const user2: Message = { role: "user", content: "follow-up after restart", timestamp: 5 };
-			const stream3 = handle2.provider.streamSimple(
+			const binding = bindings.at(-1)!;
+			handle2.syncSession({ piSessionId: "pi-1", cwd: "/work", persistedBinding: binding });
+			const user3: Message = { role: "user", content: "follow-up after restart", timestamp: 6 };
+			const restarted = await handle2.provider.streamSimple(
 				model,
-				makeContext("Be helpful.", [codemodeTool], [user1, msg1, toolRes, steer, msg2, user2]),
-				{ sessionId: "pi-1", reasoning: "low" },
-			);
-			const msg3 = await stream3.result();
-			assert.equal(msg3.stopReason, "stop");
+				makeContext("Be helpful. Tools changed.", [codemodeTool], [user1, msg1, toolRes, steer, msg2, user2, msg3, user3]),
+				{ ...liveRequest(handle2), sessionId: "pi-1", reasoning: "low" },
+			).result();
+			assert.equal(restarted.stopReason, "stop");
 			assert.equal(mainTransport2.resumedSessions.length, 1);
-			assert.equal(mainTransport2.resumedSessions[0].sessionId, bindings[0].acpSessionId);
+			assert.equal(mainTransport2.resumedSessions[0].sessionId, binding.acpSessionId);
 			// Delta prompt only contains the new user message (no <conversation_history> wrapper)
 			assert.deepEqual(mainTransport2.prompts[0].prompt, [{ type: "text", text: "follow-up after restart" }]);
 		} finally {
@@ -319,6 +355,189 @@ test("provider executes full parked Pi tool loop with steering, usage, and sessi
 	} finally {
 		await handle.dispose();
 	}
+});
+
+const user = (content: string, timestamp: number): Message => ({ role: "user", content, timestamp });
+
+function mockConversation() {
+	const transport = new MockAcpTransport();
+	const logs: string[] = [];
+	const handle = createAgyAcpProvider({
+		cacheDir: "/tmp/pi-agy-acp-unit-test",
+		createMainTransport: () => transport,
+		log: (message) => logs.push(message),
+	});
+	handle.syncSession({ piSessionId: "pi-live", cwd: "/work" });
+	const model = handle.provider.getModels()[0];
+	const turn = (system: string | SystemMessage, messages: Message[]) => handle.provider.streamSimple(
+		model,
+		makeContext(system, [], messages),
+		{ ...liveRequest(handle), sessionId: "pi-live", reasoning: "low" },
+	).result();
+	return { transport, logs, handle, turn };
+}
+
+const stockSystem = (tools: string, rules: string): SystemMessage => ({
+	role: "system",
+	content: "",
+	sections: {
+		preamble: "You are a coding assistant running inside pi, a coding agent harness.",
+		tools,
+		rules,
+		project_context: "<project_context>AGENTS.md</project_context>",
+	},
+	timestamp: 0,
+});
+
+test("a Pi tools-only system patch keeps the ACP session warm and sends a delta without resume", async (t) => {
+	const { transport, handle, turn } = mockConversation();
+	t.after(() => handle.dispose());
+	const system = stockSystem("<tools>codemode</tools>", "<rules>Be concise.</rules>");
+	const first = user("first question", 1);
+	const reply = await turn(system, [first]);
+	const toolPatch: SystemMessage = {
+		role: "system",
+		content: "",
+		sections: { tools: "<tools>codemode, fetch_content</tools>" },
+		timestamp: 2,
+	};
+	const next = await turn(system, [first, reply, toolPatch, user("next question", 3)]);
+	assert.equal(next.stopReason, "stop");
+	assert.match(transport.createdSessions[0].systemPromptAppend ?? "", /<tools>codemode<\/tools>/);
+	assert.equal(transport.createdSessions.length, 1);
+	assert.equal(transport.prompts[1].sessionId, transport.prompts[0].sessionId);
+	assert.deepEqual(transport.prompts[1].prompt, [{ type: "text", text: "next question" }]);
+	assert.deepEqual(transport.resumedSessions, []);
+});
+
+test("a rules change resumes with the full append, then tools-only changes keep that session warm", async (t) => {
+	const { transport, handle, turn } = mockConversation();
+	t.after(() => handle.dispose());
+	const first = user("first question", 1);
+	const reply = await turn(stockSystem("<tools>codemode</tools>", "<rules>Be concise.</rules>"), [first]);
+	const second = user("next question", 2);
+	const next = await turn(stockSystem("<tools>codemode, fetch_content</tools>", "<rules>Give examples.</rules>"), [first, reply, second]);
+	assert.equal(next.stopReason, "stop");
+	const sid = transport.prompts[0].sessionId;
+	assert.deepEqual(
+		transport.resumedSessions.map(({ sessionId, systemPromptAppend }) => ({ sessionId, systemPromptAppend })),
+		[{
+			sessionId: sid,
+			systemPromptAppend: "<tools>codemode, fetch_content</tools>\n\n<rules>Give examples.</rules>\n\n<project_context>AGENTS.md</project_context>",
+		}],
+	);
+	const third = await turn(stockSystem("<tools>codemode</tools>", "<rules>Give examples.</rules>"), [
+		first, reply, second, next, user("third question", 3),
+	]);
+	assert.equal(third.stopReason, "stop");
+	assert.equal(transport.createdSessions.length, 1);
+	assert.equal(transport.prompts[2].sessionId, sid);
+	assert.deepEqual(transport.prompts[2].prompt, [{ type: "text", text: "third question" }]);
+	assert.equal(transport.resumedSessions.length, 1);
+});
+
+test("changed system append resumes the same ACP session with only the next user prompt", async (t) => {
+	const { transport, handle, turn } = mockConversation();
+	t.after(() => handle.dispose());
+	const first = user("first question", 1);
+	const reply = await turn("original system", [first]);
+	transport.configCalls.length = 0;
+	const followUp = user("next question", 2);
+	const next = await turn("updated system", [first, reply, followUp]);
+	assert.equal(next.stopReason, "stop");
+
+	assert.equal(transport.createdSessions.length, 1);
+	assert.deepEqual(transport.closedSessions, []);
+	const sessionId = transport.prompts[0].sessionId;
+	assert.deepEqual(
+		transport.resumedSessions.map(({ sessionId, systemPromptAppend }) => ({ sessionId, systemPromptAppend })),
+		[{ sessionId, systemPromptAppend: "updated system" }],
+	);
+	assert.equal(transport.prompts[1].sessionId, sessionId);
+	assert.deepEqual(transport.prompts[1].prompt, [{ type: "text", text: "next question" }]);
+	assert.deepEqual(
+		Object.fromEntries(transport.configCalls.filter((call) => call.sessionId === sessionId).map((call) => [call.configId, call.value])),
+		{ model: "gemini-4-neon", thought_level: "low" },
+	);
+
+	const third = await turn("updated system", [first, reply, followUp, next, user("third question", 3)]);
+	assert.equal(third.stopReason, "stop");
+	assert.equal(transport.resumedSessions.length, 1);
+	assert.deepEqual(transport.prompts[2].prompt, [{ type: "text", text: "third question" }]);
+});
+
+test("failed append refresh keeps the warm ACP session and retries the update on the next turn", async (t) => {
+	const { transport, logs, handle, turn } = mockConversation();
+	t.after(() => handle.dispose());
+	const first = user("first question", 1);
+	const reply = await turn("original system", [first]);
+	const second = user("next question", 2);
+	transport.resumeError = new Error("resume not available");
+	const next = await turn("updated system", [first, reply, second]);
+	assert.equal(next.stopReason, "stop");
+
+	const sessionId = transport.prompts[0].sessionId;
+	assert.equal(transport.createdSessions.length, 1);
+	assert.deepEqual(transport.closedSessions, []);
+	assert.equal(transport.prompts[1].sessionId, sessionId);
+	assert.deepEqual(transport.prompts[1].prompt, [{ type: "text", text: "next question" }]);
+	assert.match(logs.join("\n"), /keeping previous system append: resume not available/);
+
+	transport.resumeError = undefined;
+	const third = await turn("updated system", [first, reply, second, next, user("third question", 3)]);
+	assert.equal(third.stopReason, "stop");
+	assert.deepEqual(
+		transport.resumedSessions.map(({ sessionId, systemPromptAppend }) => ({ sessionId, systemPromptAppend })),
+		[{ sessionId, systemPromptAppend: "updated system" }, { sessionId, systemPromptAppend: "updated system" }],
+	);
+});
+
+test("a converted Pi custom message between turns is sent as context delta, not replayed history", async (t) => {
+	const { transport, handle, turn } = mockConversation();
+	t.after(() => handle.dispose());
+	const first = user("old question", 1);
+	const reply = await turn("sys", [first]);
+	const notice = user("background task completed", 2);
+	const next = await turn("sys", [first, reply, notice, user("next question", 3)]);
+	assert.equal(next.stopReason, "stop");
+
+	assert.equal(transport.createdSessions.length, 1);
+	assert.equal(transport.prompts[1].sessionId, transport.prompts[0].sessionId);
+	const [context, question] = transport.prompts[1].prompt;
+	assert.equal(context.type, "text");
+	assert.match(context.text, /background task completed/);
+	assert.doesNotMatch(context.text, /old question|conversation_history/);
+	assert.deepEqual(question, { type: "text", text: "next question" });
+});
+
+test("a context-only Pi continuation stays warm without replaying history", async (t) => {
+	const { transport, handle, turn } = mockConversation();
+	t.after(() => handle.dispose());
+	const first = user("first question", 1);
+	const reply = await turn("sys", [first]);
+	const next = await turn("sys", [first, reply]);
+	assert.equal(next.stopReason, "stop");
+	assert.equal(transport.createdSessions.length, 1);
+	assert.equal(transport.prompts[1].sessionId, transport.prompts[0].sessionId);
+	assert.deepEqual(transport.prompts[1].prompt, [{ type: "text", text: "Continue the conversation." }]);
+});
+
+test("an edited prefix starts a new ACP session, replays the edited history, and logs why", async (t) => {
+	const { transport, logs, handle, turn } = mockConversation();
+	t.after(() => handle.dispose());
+	const reply = await turn("sys", [user("original question", 1)]);
+	const next = await turn("sys", [user("edited question", 1), reply, user("next question", 2)]);
+	assert.equal(next.stopReason, "stop");
+
+	assert.equal(transport.createdSessions.length, 2);
+	assert.notEqual(transport.prompts[1].sessionId, transport.prompts[0].sessionId);
+	const [history, question] = transport.prompts[1].prompt;
+	assert.equal(history.type, "text");
+	assert.match(history.text, /<conversation_history>[\s\S]*edited question/);
+	assert.doesNotMatch(history.text, /original question/);
+	assert.deepEqual(question, { type: "text", text: "next question" });
+	assert.match(logs.join("\n"), /full transcript replay: diverged prefix/);
+	assert.match(logs.join("\n"), /raw ACP usage[^\n]*"inputTokens":100/);
 });
 
 test("refreshModels restores stored catalog offline and persists discovered models online", async () => {
@@ -418,7 +637,7 @@ test("abandonParkedTurn cancels remote ACP session and rejects open MCP call", a
 		const stream1 = handle.provider.streamSimple(
 			model,
 			makeContext("sys", [codemodeTool], [{ role: "user", content: "go", timestamp: 1 }]),
-			{ sessionId: "pi-2" },
+			{ ...liveRequest(handle), sessionId: "pi-2" },
 		);
 		const msg1 = await stream1.result();
 		assert.equal(msg1.stopReason, "toolUse");
