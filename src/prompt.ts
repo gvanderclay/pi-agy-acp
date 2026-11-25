@@ -4,7 +4,15 @@
  */
 
 import { createHash } from "node:crypto";
-import type { ImageContent, Message, TextContent, ToolResultMessage, UserMessage } from "@earendil-works/pi-ai";
+import {
+	getCurrentSystemMessage,
+	getSystemMessageText,
+	type ImageContent,
+	type Message,
+	type TextContent,
+	type ToolResultMessage,
+	type UserMessage,
+} from "@earendil-works/pi-ai";
 import type { AcpPromptBlock } from "./acp-wire.ts";
 
 export function hashText(text: string): string {
@@ -193,4 +201,86 @@ export function extractPostAssistantTail(messages: readonly Message[]): PostAssi
 	}
 
 	return { toolResults, steeringTexts, steeringImages };
+}
+
+const PI_DEFAULT_PREAMBLE_PREFIXES = [
+	"You are a coding assistant running inside pi, a coding agent harness.",
+	"You are an expert coding assistant operating inside pi, a coding agent harness.",
+] as const;
+
+const PI_OWNED_SECTIONS = ["tools", "rules", "docs"] as const;
+const PI_DOCS_ANCHORS = ["Pi documentation", "pi-coding-agent"] as const;
+
+let warnedPreambleDrift = false;
+
+/** Reset one-time drift warning latch (for tests). */
+export function _resetSystemPromptWarnings(): void {
+	warnedPreambleDrift = false;
+}
+
+function isDefaultPiPreamble(text: string): boolean {
+	return PI_DEFAULT_PREAMBLE_PREFIXES.some((prefix) => text.startsWith(prefix));
+}
+
+function isPiDocsSection(text: string): boolean {
+	return PI_DOCS_ANCHORS.some((anchor) => text.includes(anchor));
+}
+
+function systemContentText(content: string | TextContent[]): string {
+	if (typeof content === "string") return content;
+	return content.map((part) => part.text).join("");
+}
+
+/**
+ * Renders Pi's effective system prompt for ACP `_meta.antigravity.systemPrompt.append`.
+ *
+ * When Pi is using its stock structured system prompt, omits the redundant `preamble`
+ * section (since `pi-host/agent.md` already supplies the base agent preamble) and Pi's
+ * harness `docs` section, while preserving `tools`, `rules`, `addendum`,
+ * `project_context` (`AGENTS.md`), `skills`, `cwd`, and all extension sections verbatim.
+ *
+ * Custom `--system-prompt`, forced prompts, and auxiliary prompts pass through untouched.
+ */
+export function renderSystemPromptAppend(messages: readonly Message[], log?: (message: string) => void): string {
+	const sys = getCurrentSystemMessage(messages);
+	if (!sys) return "";
+
+	const sections = sys.sections;
+	if (sections) {
+		const preamble = sections.preamble;
+		if (typeof preamble === "string" && isDefaultPiPreamble(preamble)) {
+			const parts: string[] = [];
+			const baseContent = systemContentText(sys.content);
+			if (baseContent.length > 0) parts.push(baseContent);
+
+			for (const [name, value] of Object.entries(sections)) {
+				if (value === null || value.length === 0) continue;
+				if (name === "preamble") continue;
+				if (name === "docs" && isPiDocsSection(value)) continue;
+				parts.push(value);
+			}
+			return parts.join("\n\n");
+		}
+
+		// Drift detection: if all built-in Pi sections exist alongside an unrecognized
+		// preamble, Pi may have reworded its default preamble upstream.
+		if (
+			!warnedPreambleDrift &&
+			typeof preamble === "string" &&
+			PI_OWNED_SECTIONS.every((name) => typeof sections[name] === "string")
+		) {
+			warnedPreambleDrift = true;
+			log?.(
+				"Pi system prompt has built-in sections (tools/rules/docs) with an unrecognized preamble; passing through untouched.",
+			);
+		}
+		return getSystemMessageText(sys);
+	}
+
+	const rendered = getSystemMessageText(sys);
+	if (isDefaultPiPreamble(rendered)) {
+		const splitIdx = rendered.indexOf("\n\n");
+		return splitIdx >= 0 ? rendered.slice(splitIdx + 2) : "";
+	}
+	return rendered;
 }

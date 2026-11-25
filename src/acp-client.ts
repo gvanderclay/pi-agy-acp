@@ -54,7 +54,7 @@ mainAgent: true
 excludeDefaultComponents: true
 inheritMcp: true
 ---
-You are running as a model provider inside Pi. Follow the provided system instructions and use the provided Pi tools directly when needed.
+You are a coding assistant. Follow the provided system instructions and use the available tools directly when needed.
 `;
 
 export interface AcpMcpEndpoint {

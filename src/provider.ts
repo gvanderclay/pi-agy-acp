@@ -6,7 +6,6 @@
 import {
 	calculateCost,
 	createAssistantMessageEventStream,
-	getCurrentSystemPrompt,
 	getCurrentTools,
 	type Api,
 	type AssistantMessage,
@@ -40,6 +39,7 @@ import {
 	fingerprintMessages,
 	hashText,
 	prefixBeforeLatestUser,
+	renderSystemPromptAppend,
 	renderTranscriptReplay,
 } from "./prompt.ts";
 import { projectPiTools } from "./tools.ts";
@@ -690,7 +690,7 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 			writer.fail("error", "No prompt content to send to Antigravity ACP.");
 			return;
 		}
-		const systemPrompt = getCurrentSystemPrompt(context.messages);
+		const systemPrompt = renderSystemPromptAppend(context.messages, log);
 		const transport = ensureAuxTransport();
 		let sessionId: string | undefined;
 		let latestUsageUpdate: { used: number; size: number } | null = null;
@@ -823,7 +823,7 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 		}
 
 		// Case 2: Start a fresh ACP prompt turn (reusing/resuming warm session if continuity matches).
-		const systemPrompt = getCurrentSystemPrompt(context.messages);
+		const systemPrompt = renderSystemPromptAppend(context.messages, log);
 		const systemPromptHash = hashText(systemPrompt);
 		const prefixFingerprint = fingerprintMessages(prefixBeforeLatestUser(context.messages));
 		const projectedTools = projectPiTools(getCurrentTools(context.messages));
