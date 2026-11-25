@@ -1,0 +1,57 @@
+{
+	"name": "pi-agy-acp",
+	"version": "0.1.0",
+	"description": "Pi provider backed by Antigravity CLI ACP (`agy acp`) with full Pi tool execution over an in-memory MCP bridge",
+	"keywords": [
+		"pi-package",
+		"pi",
+		"pi-extension",
+		"antigravity",
+		"acp",
+		"mcp"
+	],
+	"license": "MIT",
+	"author": "Gage Vander Clay <gvanderclay@gmail.com>",
+	"homepage": "https://github.com/gvanderclay/pi-agy-acp#readme",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/gvanderclay/pi-agy-acp.git"
+	},
+	"bugs": {
+		"url": "https://github.com/gvanderclay/pi-agy-acp/issues"
+	},
+	"type": "module",
+	"engines": {
+		"node": ">=22.19.0"
+	},
+	"packageManager": "pnpm@10.33.0",
+	"pi": {
+		"extensions": [
+			"./src/index.ts"
+		]
+	},
+	"files": [
+		"src",
+		"README.md",
+		"LICENSE"
+	],
+	"scripts": {
+		"typecheck": "tsc -p .",
+		"test": "node --test --test-timeout=30000 test/*.test.ts",
+		"test:live": "PI_AGY_ACP_LIVE=1 node --test --test-timeout=120000 test/live-smoke.test.ts",
+		"check": "pnpm typecheck && pnpm test"
+	},
+	"publishConfig": {
+		"access": "public"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-ai": ">=1.6.0",
+		"@earendil-works/pi-coding-agent": ">=1.6.0"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-ai": "1.6.0",
+		"@earendil-works/pi-coding-agent": "1.6.0",
+		"@types/node": "^22.0.0",
+		"typescript": "^5.9.0"
+	}
+}
