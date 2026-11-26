@@ -12,6 +12,7 @@ import {
 	mkdirSync,
 	readdirSync,
 	rmSync,
+	statSync,
 	symlinkSync,
 	writeFileSync,
 } from "node:fs";
@@ -44,6 +45,9 @@ const CLIENT_VERSION = "0.1.0";
 const KILL_GRACE_MS = 3_000;
 const CANCEL_GRACE_MS = 3_000;
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 30_000;
+const CONVERSATION_TTL_MS = 14 * 24 * 60 * 60 * 1000;
+const LOG_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const TMP_FILE_TTL_MS = 60 * 60 * 1000;
 const PARENT_SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
 const IS_WINDOWS = process.platform === "win32";
 
@@ -177,6 +181,100 @@ function sweepDeadInstances(instancesRoot: string): void {
 	}
 }
 
+function safeMtimeMs(filePath: string): number | undefined {
+	try {
+		return statSync(filePath).mtimeMs;
+	} catch {
+		return undefined;
+	}
+}
+
+function safeRm(targetPath: string, recursive = false): void {
+	try {
+		rmSync(targetPath, { recursive, force: true });
+	} catch {
+		// Best effort.
+	}
+}
+
+function safeReaddir(dirPath: string): string[] {
+	try {
+		return readdirSync(dirPath);
+	} catch {
+		return [];
+	}
+}
+
+/**
+ * Best-effort TTL cleanup for the shared `antigravity-cli/` cache directory.
+ * Removes stale conversation DBs (and matching brain/annotations/implicit files)
+ * older than 14 days, logs/crashes older than 7 days, and stray `.tmp` files
+ * older than 1 hour. Never touches `conversation_summaries.db` (reconciled by `agy`).
+ */
+export function sweepStaleAppData(appDataDir: string, nowMs = Date.now()): void {
+	const conversationsDir = join(appDataDir, "conversations");
+	const brainDir = join(appDataDir, "brain");
+	const annotationsDir = join(appDataDir, "annotations");
+	const implicitDir = join(appDataDir, "implicit");
+	const annotationEntries = safeReaddir(annotationsDir);
+
+	const liveIds = new Set<string>();
+	for (const name of safeReaddir(conversationsDir)) {
+		if (!name.endsWith(".db")) continue;
+		const id = name.slice(0, -".db".length);
+		const dbPath = join(conversationsDir, name);
+		const walPath = `${dbPath}-wal`;
+		const dbMtime = safeMtimeMs(dbPath);
+		if (dbMtime === undefined) continue;
+		const walMtime = safeMtimeMs(walPath) ?? 0;
+		const latestMtime = Math.max(dbMtime, walMtime);
+		if (nowMs - latestMtime <= CONVERSATION_TTL_MS) {
+			liveIds.add(id);
+			continue;
+		}
+		safeRm(dbPath);
+		safeRm(walPath);
+		safeRm(`${dbPath}-shm`);
+		safeRm(join(brainDir, id), true);
+		safeRm(join(implicitDir, `${id}.pb`));
+		for (const ann of annotationEntries) {
+			if (ann === id || ann.startsWith(`${id}.`)) safeRm(join(annotationsDir, ann));
+		}
+	}
+
+	// Clean up orphaned brain directories with no active conversation DB.
+	for (const id of safeReaddir(brainDir)) {
+		if (liveIds.has(id)) continue;
+		const dirPath = join(brainDir, id);
+		const mtime = safeMtimeMs(dirPath);
+		if (mtime !== undefined && nowMs - mtime > CONVERSATION_TTL_MS) {
+			safeRm(dirPath, true);
+		}
+	}
+
+	// Clean up old ACP server logs and crash logs.
+	for (const sub of ["log", "crashes"] as const) {
+		const subDir = join(appDataDir, sub);
+		for (const name of safeReaddir(subDir)) {
+			const filePath = join(subDir, name);
+			const mtime = safeMtimeMs(filePath);
+			if (mtime !== undefined && nowMs - mtime > LOG_TTL_MS) {
+				safeRm(filePath);
+			}
+		}
+	}
+
+	// Clean up stray `.tmp` files left behind by interrupted atomic writes.
+	for (const name of safeReaddir(appDataDir)) {
+		if (!name.endsWith(".tmp")) continue;
+		const filePath = join(appDataDir, name);
+		const mtime = safeMtimeMs(filePath);
+		if (mtime !== undefined && nowMs - mtime > TMP_FILE_TTL_MS) {
+			safeRm(filePath);
+		}
+	}
+}
+
 function createIsolatedGeminiDir(
 	cacheDir: string,
 	mcpEndpoint: AcpMcpEndpoint | undefined,
@@ -186,7 +284,10 @@ function createIsolatedGeminiDir(
 	const sharedAppDataDir = join(absCacheDir, APP_DATA_DIR_NAME);
 	const instancesRoot = join(absCacheDir, "instances");
 
-	if (!ephemeral) mkdirSync(sharedAppDataDir, { recursive: true, mode: 0o700 });
+	if (!ephemeral) {
+		mkdirSync(sharedAppDataDir, { recursive: true, mode: 0o700 });
+		sweepStaleAppData(sharedAppDataDir);
+	}
 	mkdirSync(instancesRoot, { recursive: true, mode: 0o700 });
 	sweepDeadInstances(instancesRoot);
 
