@@ -49,6 +49,7 @@ export const AGY_ACP_API = "agy-acp";
 
 const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 const DEFAULT_PARK_BATCH_MS = 10;
+const DEFAULT_AUX_IDLE_MS = 60_000;
 
 export interface PersistedAcpBinding {
 	piSessionId: string;
@@ -70,6 +71,8 @@ export interface AgyAcpProviderOptions {
 	cacheDir: string;
 	binaryPath?: string;
 	parkBatchMs?: number;
+	/** Idle timeout before disposing the auxiliary `agy acp` process (default 60s). */
+	auxIdleMs?: number;
 	log?: (message: string) => void;
 	onBindingChange?: (binding: PersistedAcpBinding) => void;
 	/** Test seams: inject custom MCP server / ACP transports instead of spawning real processes. */
@@ -212,7 +215,7 @@ export function normalizeTurnUsage(
 
 	let input = Math.max(0, raw.inputTokens);
 	let cacheRead = Math.max(0, raw.cachedReadTokens);
-	const cacheWrite = Math.max(0, raw.cachedWriteTokens);
+	let cacheWrite = Math.max(0, raw.cachedWriteTokens);
 	const output = Math.max(0, raw.outputTokens);
 	const reasoning = raw.thoughtTokens > 0 ? Math.min(raw.thoughtTokens, output || raw.thoughtTokens) : undefined;
 
@@ -223,6 +226,7 @@ export function normalizeTurnUsage(
 			const ratio = targetContext / rawPromptTotal;
 			input = Math.round(input * ratio);
 			cacheRead = Math.round(cacheRead * ratio);
+			cacheWrite = Math.round(cacheWrite * ratio);
 		}
 	}
 
@@ -325,6 +329,7 @@ interface ActiveBridge {
 	model: Model<Api>;
 	cwd: string;
 	systemPromptHash: string;
+	promptController: AbortController;
 	writer: MessageWriter | null;
 	onRawUpdate?: (params: unknown) => void;
 	detachSignal: (() => void) | null;
@@ -438,6 +443,7 @@ function finishFromStopReason(writer: MessageWriter, stopReason: AcpPromptResult
 export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProviderHandle {
 	const log = options.log ?? (() => {});
 	const parkBatchMs = options.parkBatchMs ?? DEFAULT_PARK_BATCH_MS;
+	const auxIdleMs = options.auxIdleMs ?? DEFAULT_AUX_IDLE_MS;
 
 	let models: Model<typeof AGY_ACP_API>[] = [...BASELINE_MODELS];
 	let activePiSessionId: string | undefined;
@@ -451,6 +457,8 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 	let mcpStarting: Promise<McpBridgeServer> | null = null;
 	let mainTransport: AcpTransport | null = null;
 	let auxTransport: AcpTransport | null = null;
+	let auxInFlight = 0;
+	let auxIdleTimer: NodeJS.Timeout | null = null;
 
 	const checkAvailable = (): boolean =>
 		options.checkAvailable ? options.checkAvailable() : resolveAgyBinary(options.binaryPath) !== undefined;
@@ -485,7 +493,23 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 		return { transport: mainTransport, mcp };
 	};
 
-	const ensureAuxTransport = (): AcpTransport => {
+	const disposeAuxTransport = (): void => {
+		if (auxIdleTimer) {
+			clearTimeout(auxIdleTimer);
+			auxIdleTimer = null;
+		}
+		if (auxTransport) {
+			auxTransport.dispose();
+			auxTransport = null;
+		}
+	};
+
+	const acquireAuxTransport = (): AcpTransport => {
+		if (auxIdleTimer) {
+			clearTimeout(auxIdleTimer);
+			auxIdleTimer = null;
+		}
+		auxInFlight += 1;
 		if (!auxTransport) {
 			auxTransport = options.createAuxTransport
 				? options.createAuxTransport()
@@ -493,10 +517,26 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 						binaryPath: options.binaryPath,
 						cacheDir: options.cacheDir,
 						mcpEndpoint: undefined,
+						ephemeral: true,
 						log: (msg) => log(`aux: ${msg}`),
 					});
 		}
 		return auxTransport;
+	};
+
+	const releaseAuxTransport = (immediate = false): void => {
+		auxInFlight = Math.max(0, auxInFlight - 1);
+		if (auxInFlight > 0 || !auxTransport) return;
+		if (immediate || auxIdleMs <= 0) {
+			disposeAuxTransport();
+			return;
+		}
+		if (auxIdleTimer) clearTimeout(auxIdleTimer);
+		auxIdleTimer = setTimeout(() => {
+			auxIdleTimer = null;
+			if (auxInFlight === 0) disposeAuxTransport();
+		}, auxIdleMs);
+		auxIdleTimer.unref();
 	};
 
 	const takeLiveRequest = (streamOptions: StreamOptions | undefined): boolean => {
@@ -533,7 +573,7 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 			for (const park of bridge.awaitingResults.values()) park.reject(reason);
 			bridge.awaitingResults.clear();
 			mcpServer?.failAllParks(reason);
-			mainTransport?.cancel(bridge.sessionId);
+			bridge.promptController.abort();
 		}
 
 		if (activeBridge === bridge) {
@@ -705,7 +745,7 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 			return;
 		}
 		const systemPrompt = renderSystemPromptAppend(context.messages, log);
-		const transport = ensureAuxTransport();
+		const transport = acquireAuxTransport();
 		let sessionId: string | undefined;
 		let latestUsageUpdate: { used: number; size: number } | null = null;
 
@@ -752,6 +792,7 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 			else writer.fail("error", errorMessage(error));
 		} finally {
 			if (sessionId) await transport.closeSession(sessionId);
+			releaseAuxTransport(false);
 		}
 	}
 
@@ -970,6 +1011,7 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 			model,
 			cwd: activeCwd,
 			systemPromptHash: session.systemPromptHash,
+			promptController: new AbortController(),
 			writer,
 			onRawUpdate,
 			detachSignal: null,
@@ -1013,6 +1055,7 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 			.prompt({
 				sessionId,
 				prompt: finalPrompt,
+				signal: bridge.promptController.signal,
 				onRawUpdate: (raw) => bridge.onRawUpdate?.(raw),
 				onUpdate: (update) => routeUpdate(bridge, update),
 			})
@@ -1069,7 +1112,7 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 
 		if (!context.allowNetwork || context.signal.aborted || !checkAvailable()) return;
 
-		const transport = ensureAuxTransport();
+		const transport = acquireAuxTransport();
 		let probeSessionId: string | undefined;
 		try {
 			const created = await transport.createSession({ cwd: activeCwd, signal: context.signal });
@@ -1087,6 +1130,7 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 			log(`model discovery failed: ${errorMessage(error)}`);
 		} finally {
 			if (probeSessionId) await transport.closeSession(probeSessionId);
+			releaseAuxTransport(true);
 		}
 	};
 
@@ -1152,8 +1196,7 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 			boundSession = null;
 			mainTransport?.dispose();
 			mainTransport = null;
-			auxTransport?.dispose();
-			auxTransport = null;
+			disposeAuxTransport();
 			if (mcpServer) {
 				await mcpServer.stop();
 				mcpServer = null;

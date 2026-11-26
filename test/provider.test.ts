@@ -140,7 +140,13 @@ class MockAcpTransport implements AcpTransport {
 
 	async prompt(request: AcpPromptCall): Promise<AcpPromptResult> {
 		this.prompts.push(request);
-		return this.promptImpl(request);
+		const onAbort = () => this.cancel(request.sessionId);
+		request.signal?.addEventListener("abort", onAbort, { once: true });
+		try {
+			return await this.promptImpl(request);
+		} finally {
+			request.signal?.removeEventListener("abort", onAbort);
+		}
 	}
 
 	cancel(sessionId: string) {
@@ -173,13 +179,14 @@ test("normalizeTurnUsage scales multi-step cumulative usage to final context occ
 	const model = modelsFromSessionConfig(makeMockConfig())[1];
 	const normalized = normalizeTurnUsage(
 		model,
-		{ inputTokens: 6000, outputTokens: 200, cachedReadTokens: 24000, cachedWriteTokens: 0, thoughtTokens: 50, totalTokens: 30200 },
+		{ inputTokens: 6000, outputTokens: 200, cachedReadTokens: 21000, cachedWriteTokens: 3000, thoughtTokens: 50, totalTokens: 30200 },
 		{ used: 10200, size: 1_048_576 },
 		3,
 	);
-	// Target prompt context = 10200 - 200 = 10000; 20% input (2000) + 80% cacheRead (8000)
+	// Target prompt context = 10200 - 200 = 10000; 20% input (2000) + 70% cacheRead (7000) + 10% cacheWrite (1000)
 	assert.equal(normalized.input, 2000);
-	assert.equal(normalized.cacheRead, 8000);
+	assert.equal(normalized.cacheRead, 7000);
+	assert.equal(normalized.cacheWrite, 1000);
 	assert.equal(normalized.output, 200);
 	assert.equal(normalized.reasoning, 50);
 	assert.equal(normalized.totalTokens, 10200);
@@ -590,6 +597,7 @@ test("refreshModels restores stored catalog offline and persists discovered mode
 		assert.equal(persistedCount, 4);
 		assert.equal(handle.provider.getModels().length, 4);
 		assert.equal(auxTransport.closedSessions.length, 1);
+		assert.equal(auxTransport.disposed, true);
 	} finally {
 		await handle.dispose();
 	}
@@ -651,4 +659,91 @@ test("abandonParkedTurn cancels remote ACP session and rejects open MCP call", a
 	} finally {
 		await handle.dispose();
 	}
+});
+
+test("aborting a main turn aborts the underlying ACP prompt signal so a follow-up turn runs cleanly", async (t) => {
+	const mainTransport = new MockAcpTransport();
+	const handle = createAgyAcpProvider({
+		cacheDir: "/tmp/pi-agy-acp-unit-test-4",
+		checkAvailable: () => true,
+		createMainTransport: () => mainTransport,
+	});
+	t.after(() => handle.dispose());
+	handle.syncSession({ piSessionId: "pi-abort", cwd: "/work" });
+	const model = handle.provider.getModels()[0];
+
+	let firstSignalAborted = false;
+	mainTransport.promptImpl = (req) =>
+		new Promise((resolve) => {
+			if (mainTransport.prompts.length === 1) {
+				req.signal?.addEventListener(
+					"abort",
+					() => {
+						firstSignalAborted = true;
+						resolve({ stopReason: "cancelled", usage: undefined });
+					},
+					{ once: true },
+				);
+			} else {
+				req.onUpdate({ type: "agent_message_chunk", text: "Recovered" });
+				resolve({ stopReason: "end_turn", usage: undefined });
+			}
+		});
+
+	const ac = new AbortController();
+	const firstStream = handle.provider.streamSimple(
+		model,
+		makeContext("sys", [], [user("slow task", 1)]),
+		{ ...liveRequest(handle, ac.signal), sessionId: "pi-abort" },
+	);
+	await new Promise((r) => setTimeout(r, 20));
+	ac.abort();
+	const abortedMsg = await firstStream.result();
+	assert.equal(abortedMsg.stopReason, "aborted");
+	assert.equal(firstSignalAborted, true);
+	assert.equal(mainTransport.cancelledSessions.length, 1);
+
+	const nextMsg = await handle.provider.streamSimple(
+		model,
+		makeContext("sys", [], [user("try again", 2)]),
+		{ ...liveRequest(handle), sessionId: "pi-abort" },
+	).result();
+	assert.equal(nextMsg.stopReason, "stop");
+	assert.equal(mainTransport.prompts.length, 2);
+});
+
+test("auxTransport is disposed after auxIdleMs of inactivity", async (t) => {
+	const created: MockAcpTransport[] = [];
+	const handle = createAgyAcpProvider({
+		cacheDir: "/tmp/pi-agy-acp-unit-test-5",
+		auxIdleMs: 25,
+		checkAvailable: () => true,
+		createAuxTransport: () => {
+			const transport = new MockAcpTransport();
+			created.push(transport);
+			return transport;
+		},
+	});
+	t.after(() => handle.dispose());
+	const model = handle.provider.getModels()[0];
+
+	const msg1 = await handle.provider.streamSimple(
+		model,
+		makeContext("Summarize", [], [user("text 1", 1)]),
+		{},
+	).result();
+	assert.equal(msg1.stopReason, "stop");
+	assert.equal(created.length, 1);
+	assert.equal(created[0].disposed, false);
+
+	await new Promise((r) => setTimeout(r, 60));
+	assert.equal(created[0].disposed, true);
+
+	const msg2 = await handle.provider.streamSimple(
+		model,
+		makeContext("Summarize", [], [user("text 2", 2)]),
+		{},
+	).result();
+	assert.equal(msg2.stopReason, "stop");
+	assert.equal(created.length, 2);
 });

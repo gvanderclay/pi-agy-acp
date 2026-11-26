@@ -108,6 +108,8 @@ export interface AgyAcpClientOptions {
 	cacheDir: string;
 	/** When set, exposes Pi's in-memory MCP server with `timeoutSeconds: -1`. When omitted, configures zero MCP servers. */
 	mcpEndpoint?: AcpMcpEndpoint;
+	/** When true, uses an isolated per-process app data directory instead of symlinking the shared SQLite store. */
+	ephemeral?: boolean;
 	handshakeTimeoutMs?: number;
 	log?: (message: string) => void;
 }
@@ -175,12 +177,16 @@ function sweepDeadInstances(instancesRoot: string): void {
 	}
 }
 
-function createIsolatedGeminiDir(cacheDir: string, mcpEndpoint: AcpMcpEndpoint | undefined): string {
+function createIsolatedGeminiDir(
+	cacheDir: string,
+	mcpEndpoint: AcpMcpEndpoint | undefined,
+	ephemeral = false,
+): string {
 	const absCacheDir = resolve(cacheDir);
 	const sharedAppDataDir = join(absCacheDir, APP_DATA_DIR_NAME);
 	const instancesRoot = join(absCacheDir, "instances");
 
-	mkdirSync(sharedAppDataDir, { recursive: true, mode: 0o700 });
+	if (!ephemeral) mkdirSync(sharedAppDataDir, { recursive: true, mode: 0o700 });
 	mkdirSync(instancesRoot, { recursive: true, mode: 0o700 });
 	sweepDeadInstances(instancesRoot);
 
@@ -188,11 +194,14 @@ function createIsolatedGeminiDir(cacheDir: string, mcpEndpoint: AcpMcpEndpoint |
 	const agentDir = join(instanceDir, "config", "agents", AGENT_NAME);
 	mkdirSync(agentDir, { recursive: true, mode: 0o700 });
 
-	// Share the SQLite conversation store across restarts while keeping `config/`
-	// isolated per Pi process so concurrent tmux panes never collide on MCP ports.
-	const linkedAppData = join(instanceDir, APP_DATA_DIR_NAME);
-	if (!existsSync(linkedAppData)) {
-		symlinkSync(sharedAppDataDir, linkedAppData, IS_WINDOWS ? "junction" : "dir");
+	// Main sessions share the SQLite conversation store across restarts while
+	// keeping `config/` isolated per process. Ephemeral aux transports get their
+	// own isolated app data directory so throwaway calls never contend on SQLite.
+	const instanceAppData = join(instanceDir, APP_DATA_DIR_NAME);
+	if (ephemeral) {
+		mkdirSync(instanceAppData, { recursive: true, mode: 0o700 });
+	} else if (!existsSync(instanceAppData)) {
+		symlinkSync(sharedAppDataDir, instanceAppData, IS_WINDOWS ? "junction" : "dir");
 	}
 
 	writeFileSync(join(agentDir, "agent.md"), PI_HOST_AGENT_MD, { mode: 0o600 });
@@ -414,6 +423,7 @@ export class AgyAcpClient implements AcpTransport {
 			if (!signal) return await finished;
 			return await new Promise<AcpPromptResult>((resolvePromise, rejectPromise) => {
 				const onAbort = () => {
+					if (this.activeTurn === request) this.activeTurn = null;
 					this.cancel(request.sessionId);
 					this.draining = settleWithin(response, CANCEL_GRACE_MS);
 					resolvePromise({ stopReason: "cancelled", usage: undefined });
@@ -470,7 +480,11 @@ export class AgyAcpClient implements AcpTransport {
 				"Antigravity CLI ('agy') was not found on PATH. Install it or set PI_AGY_ACP_BIN to its path.",
 			);
 		}
-		const instanceDir = createIsolatedGeminiDir(this.options.cacheDir, this.options.mcpEndpoint);
+		const instanceDir = createIsolatedGeminiDir(
+			this.options.cacheDir,
+			this.options.mcpEndpoint,
+			this.options.ephemeral,
+		);
 		const args = [
 			"acp",
 			"--stdio",
