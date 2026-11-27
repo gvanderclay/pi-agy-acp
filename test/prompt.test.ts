@@ -10,6 +10,7 @@ import {
 	renderSystemPromptAppend,
 	renderTranscriptDelta,
 	renderTranscriptReplay,
+	type HostPromptSources,
 } from "../src/prompt.ts";
 
 const makeAssistant = (text: string, thinking?: string): AssistantMessage => ({
@@ -154,7 +155,7 @@ test("renderSystemPromptAppend omits stock Pi preamble and docs while keeping pr
 	const rendered = renderSystemPromptAppend(messages);
 	assert.doesNotMatch(rendered, /coding agent harness/);
 	assert.doesNotMatch(rendered, /Pi documentation/);
-	assert.match(rendered, /<tools>/);
+	assert.doesNotMatch(rendered, /<tools>/);
 	assert.match(rendered, /<rules>/);
 	assert.match(rendered, /AGENTS\.md content/);
 	assert.match(rendered, /<skills>/);
@@ -183,6 +184,41 @@ test("renderSystemPromptAppend preserves custom --system-prompt and forced promp
 		{ role: "system", content: "Summarize this conversation.", timestamp: 0 },
 	];
 	assert.equal(renderSystemPromptAppend(forcedMessages), "Summarize this conversation.");
+});
+
+test("host append uses explicit rule sources and preserves project, role, skills and custom sections", () => {
+	const sources: HostPromptSources = {
+		selectedTools: ["codemode"], toolGuidelines: { codemode: ["Use the tool's namespace."] },
+		promptGuidelines: ["Keep the task's acceptance checks."], sections: {},
+	};
+	const messages: Message[] = [{ role: "system", timestamp: 0, content: "", sections: {
+		preamble: "You are a coding assistant running inside pi, a coding agent harness.",
+		tools: "<tools>\nGeneric descriptions\n</tools>",
+		rules: "<rules>\n- Be concise in your responses\n</rules>",
+		docs: "<docs>\nPi documentation: /pi/README.md\n</docs>",
+		addendum: "<addendum>\nExplorer role\n</addendum>",
+		project_context: "<project_context>\nKeep references to pi-coding-agent in this project.\n</project_context>",
+		skills: "<skills>\nResearch skill\n</skills>",
+		permission_rules: "<permission_rules>\nDo not write outside the workspace.\n</permission_rules>",
+	} }];
+	const rendered = renderSystemPromptAppend(messages, undefined, sources);
+	assert.doesNotMatch(rendered, /coding agent harness|Generic descriptions|Be concise|Pi documentation/);
+	for (const text of ["Use the tool's namespace.", "acceptance checks", "Explorer role", "pi-coding-agent", "Research skill", "Do not write outside"]) assert.ok(rendered.includes(text));
+	const hash = hashSystemPromptAppend(messages, sources);
+	sources.promptGuidelines.push("New extension requirement.");
+	assert.notEqual(hashSystemPromptAppend(messages, sources), hash);
+	sources.sections.tools = "Explicit tool instructions";
+	const customToolsHash = hashSystemPromptAppend(messages, sources);
+	assert.notEqual(hashSystemPromptAppend([...messages, { role: "system", content: "", timestamp: 1, sections: { tools: "Revised explicit tool instructions" } }], sources), customToolsHash);
+	sources.sections.docs = "Pi documentation deliberately supplied by an extension";
+	assert.match(renderSystemPromptAppend(messages, undefined, sources), /Pi documentation/);
+});
+
+test("flattened stock prompts fail locally instead of deleting or forwarding unknown instructions", () => {
+	const content = "You are a coding assistant running inside pi, a coding agent harness.\n\n<docs>\nPi documentation\n</docs>\n\nImportant delegate instructions";
+	assert.throws(() => renderSystemPromptAppend([{ role: "system", content, timestamp: 0 }]), /Flattened stock Pi system prompt/);
+	const custom = "Review this literal example: <docs>Pi documentation</docs>. Keep pi-coding-agent names intact.";
+	assert.equal(renderSystemPromptAppend([{ role: "system", content: custom, timestamp: 0 }]), custom);
 });
 
 test("append continuity includes custom prompt text and non-tool sections", () => {

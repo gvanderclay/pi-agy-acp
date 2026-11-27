@@ -10,7 +10,7 @@ const LIVE = process.env.PI_AGY_ACP_LIVE === "1";
 
 function liveRequest(handle: AgyAcpProviderHandle, signal = new AbortController().signal) {
 	handle.expectLiveRequest(signal);
-	return { signal, onProviderStreamEvent: () => {}, sessionId: "live-pi-1", reasoning: "low" as const };
+	return { signal, onProviderStreamEvent: () => {}, sessionId: "live-pi-1", reasoning: "medium" as const };
 }
 
 function makeContext(systemPrompt: string, tools: Tool[], messages: Message[]): TranscriptContext {
@@ -52,12 +52,12 @@ test(
 					return true;
 				},
 			});
-			const flash = handle1.provider.getModels().find((m) => m.id === "gemini-3.8-flash");
-			assert.ok(flash, `expected gemini-3.8-flash in discovered models (${handle1.provider.getModels().map((m) => m.id).join(", ")})`);
+			const flash = handle1.provider.getModels().find((m) => m.id === "gemini-4-neon");
+			assert.ok(flash, `expected gemini-4-neon in discovered models (${handle1.provider.getModels().map((m) => m.id).join(", ")})`);
 
 			// 2. Parked Pi tool execution round-trip
 			handle1.syncSession({ piSessionId: "live-pi-1", cwd: process.cwd() });
-			const sysPrompt = "You are inside Pi. Secret word: VELVET-9012. Always call codemode when asked.";
+			const sysPrompt = "Project rule: Secret word: VELVET-9012. Always call codemode when asked.";
 			const user1: Message = {
 				role: "user",
 				content: "Call the codemode tool with code `21 * 2` and then state the returned number.",

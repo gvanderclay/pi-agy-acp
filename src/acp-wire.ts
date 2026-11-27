@@ -16,6 +16,22 @@ const optionalString = (value: unknown): string | undefined => (typeof value ===
 const optionalNumber = (value: unknown): number | undefined =>
 	typeof value === "number" && Number.isFinite(value) ? value : undefined;
 
+/** Pi mediates its own MCP tools. Never approve native tools or auxiliary calls. */
+export function piToolPermission(params: unknown, hasPiTools: boolean): {
+	outcome: { outcome: "selected"; optionId: string } | { outcome: "cancelled" };
+} {
+	if (hasPiTools && isRecord(params) && isRecord(params.toolCall) &&
+		typeof params.toolCall.name === "string" && params.toolCall.name.startsWith("mcp_pi-tools_") &&
+		Array.isArray(params.options)) {
+		const allow = params.options.find((option: unknown) =>
+			isRecord(option) && option.kind === "allow_once" && typeof option.optionId === "string");
+		if (isRecord(allow) && typeof allow.optionId === "string") {
+			return { outcome: { outcome: "selected", optionId: allow.optionId } };
+		}
+	}
+	return { outcome: { outcome: "cancelled" } };
+}
+
 function oneOf<T extends string>(allowed: readonly T[], value: unknown): T | undefined {
 	return allowed.includes(value as T) ? (value as T) : undefined;
 }

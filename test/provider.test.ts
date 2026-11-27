@@ -16,10 +16,12 @@ import type {
 	AcpTransport,
 } from "../src/acp-client.ts";
 import type { AcpAgentInfo, AcpPromptResult, AcpSessionConfig } from "../src/acp-wire.ts";
+import { fingerprintMessages } from "../src/prompt.ts";
 import { McpBridgeServer, MCP_TOKEN_HEADER } from "../src/mcp-server.ts";
 import {
 	AGY_ACP_API,
 	AGY_ACP_PROVIDER_ID,
+	ACP_CONFIGURATION_VERSION,
 	createAgyAcpProvider,
 	modelsFromSessionConfig,
 	normalizeTurnUsage,
@@ -384,6 +386,62 @@ function mockConversation() {
 	return { transport, logs, handle, turn };
 }
 
+test("legacy bindings replay with the new agent instead of resuming its old prompt configuration", async () => {
+	const { transport, handle, turn } = mockConversation();
+	try {
+		const prior = user("old task", 1);
+		handle.syncSession({ piSessionId: "pi-live", cwd: "/work", persistedBinding: {
+			piSessionId: "pi-live", acpSessionId: "old-agent", cwd: "/work", modelId: "gemini-4-neon",
+			syncedFingerprint: fingerprintMessages([prior]), systemPromptHash: "old",
+		} });
+		await turn("Project rules.", [prior, user("new task", 2)]);
+		assert.equal(transport.resumedSessions.length, 0);
+		assert.equal(transport.createdSessions.length, 1);
+		assert.match(JSON.stringify(transport.prompts[0].prompt), /old task/);
+	} finally { await handle.dispose(); }
+});
+
+test("a flattened stock prompt ends the stream with a local error before starting ACP", async () => {
+	const { transport, handle, turn } = mockConversation();
+	try {
+		const result = await turn("You are a coding assistant running inside pi, a coding agent harness.\n\n<docs>Pi documentation</docs>", [user("hello", 1)]);
+		assert.equal(result.stopReason, "error");
+		assert.match(result.errorMessage!, /Flattened stock Pi/);
+		assert.equal(transport.createdSessions.length, 0);
+	} finally { await handle.dispose(); }
+});
+
+for (const auxiliary of [false, true]) {
+	test(`terminal ACP warning fails ${auxiliary ? "auxiliary" : "main"} turn without publishing a successful binding`, async () => {
+		const transport = new MockAcpTransport();
+		const bindings: PersistedAcpBinding[] = [];
+		const handle = createAgyAcpProvider({ cacheDir: "/tmp/pi-agy-acp-unit-test", createMainTransport: () => transport,
+			createAuxTransport: () => transport, onBindingChange: (binding) => bindings.push(binding) });
+		handle.syncSession({ piSessionId: "pi-live", cwd: "/work" });
+		const warning = "⚠ RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota).";
+		transport.promptImpl = async (request) => {
+			request.onUpdate({ type: "agent_message_chunk", text: warning.slice(0, 15) });
+			request.onUpdate({ type: "agent_message_chunk", text: warning.slice(15) });
+			return { stopReason: "end_turn", usage: { inputTokens: 0, outputTokens: 0, thoughtTokens: 0, cachedReadTokens: 0, cachedWriteTokens: 0, totalTokens: 0 } };
+		};
+		try {
+			const model = handle.provider.getModels()[0];
+			const result = await handle.provider.streamSimple(model, makeContext("Project rules.", [], [user("hello", 1)]), auxiliary ? {} : { ...liveRequest(handle), sessionId: "pi-live" }).result();
+			assert.equal(result.stopReason, "error");
+			assert.equal(result.errorMessage, warning);
+			assert.equal(bindings.length, 0);
+			transport.promptImpl = async (request) => {
+				request.onUpdate({ type: "agent_message_chunk", text: "Recovered" });
+				return { stopReason: "end_turn", usage: undefined };
+			};
+			if (!auxiliary) {
+				await handle.provider.streamSimple(model, makeContext("Project rules.", [], [user("retry", 2)]), { ...liveRequest(handle), sessionId: "pi-live" }).result();
+				assert.equal(bindings[0].configurationVersion, ACP_CONFIGURATION_VERSION);
+			}
+		} finally { await handle.dispose(); }
+	});
+}
+
 const stockSystem = (tools: string, rules: string): SystemMessage => ({
 	role: "system",
 	content: "",
@@ -410,7 +468,7 @@ test("a Pi tools-only system patch keeps the ACP session warm and sends a delta 
 	};
 	const next = await turn(system, [first, reply, toolPatch, user("next question", 3)]);
 	assert.equal(next.stopReason, "stop");
-	assert.match(transport.createdSessions[0].systemPromptAppend ?? "", /<tools>codemode<\/tools>/);
+	assert.doesNotMatch(transport.createdSessions[0].systemPromptAppend ?? "", /<tools>/);
 	assert.equal(transport.createdSessions.length, 1);
 	assert.equal(transport.prompts[1].sessionId, transport.prompts[0].sessionId);
 	assert.deepEqual(transport.prompts[1].prompt, [{ type: "text", text: "next question" }]);
@@ -430,7 +488,7 @@ test("a rules change resumes with the full append, then tools-only changes keep 
 		transport.resumedSessions.map(({ sessionId, systemPromptAppend }) => ({ sessionId, systemPromptAppend })),
 		[{
 			sessionId: sid,
-			systemPromptAppend: "<tools>codemode, fetch_content</tools>\n\n<rules>Give examples.</rules>\n\n<project_context>AGENTS.md</project_context>",
+			systemPromptAppend: "<rules>Give examples.</rules>\n\n<project_context>AGENTS.md</project_context>",
 		}],
 	);
 	const third = await turn(stockSystem("<tools>codemode</tools>", "<rules>Give examples.</rules>"), [

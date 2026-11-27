@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { getAgentDir, type ExtensionAPI, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { isRecord } from "./acp-wire.ts";
 import { createAgyAcpProvider, type PersistedAcpBinding } from "./provider.ts";
+import type { HostPromptSources } from "./prompt.ts";
 
 const BINDING_ENTRY_TYPE = "agy-acp-state";
 
@@ -26,6 +27,7 @@ function extractPersistedBinding(branch: readonly SessionEntry[]): PersistedAcpB
 			typeof data.modelId === "string"
 		) {
 			return {
+				configurationVersion: typeof data.configurationVersion === "number" ? data.configurationVersion : undefined,
 				piSessionId: data.piSessionId,
 				acpSessionId: data.acpSessionId,
 				syncedFingerprint: data.syncedFingerprint,
@@ -64,10 +66,12 @@ export default function agyAcpExtension(pi: ExtensionAPI): void {
 	log?.(`Loaded provider from ${import.meta.url}`);
 
 	let canAppendEntries = false;
+	let promptSources: HostPromptSources | undefined;
 
 	const handle = createAgyAcpProvider({
 		cacheDir,
 		log,
+		getPromptSources: () => promptSources,
 		onBindingChange: (binding) => {
 			if (!canAppendEntries) return;
 			try {
@@ -81,6 +85,7 @@ export default function agyAcpExtension(pi: ExtensionAPI): void {
 	pi.registerProvider(handle.provider);
 
 	pi.on("session_start", (event, ctx) => {
+		promptSources = undefined;
 		canAppendEntries = true;
 		const persistedBinding = extractPersistedBinding(ctx.sessionManager.getBranch());
 		handle.syncSession({
@@ -92,6 +97,7 @@ export default function agyAcpExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_tree", (_event, ctx) => {
+		promptSources = undefined;
 		const persistedBinding = extractPersistedBinding(ctx.sessionManager.getBranch());
 		handle.syncSession({
 			piSessionId: ctx.sessionManager.getSessionId(),
@@ -102,6 +108,12 @@ export default function agyAcpExtension(pi: ExtensionAPI): void {
 
 	pi.on("session_compact", () => {
 		handle.invalidateSession("compact");
+	});
+
+	pi.on("before_agent_start", (event) => {
+		// Pi shares this mutable object across handlers. Read it only at request
+		// time, after later extensions have added their rules and sections.
+		promptSources = event.systemPromptOptions;
 	});
 
 	pi.on("context_with_system", (_event, ctx) => {

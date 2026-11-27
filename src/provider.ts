@@ -33,6 +33,7 @@ import {
 	type AcpUsage,
 } from "./acp-wire.ts";
 import { McpBridgeServer, type ParkedToolCall } from "./mcp-server.ts";
+import { terminalAcpError } from "./errors.ts";
 import {
 	extractPostAssistantTail,
 	fingerprintMessages,
@@ -41,17 +42,21 @@ import {
 	renderSystemPromptAppend,
 	renderTranscriptDelta,
 	renderTranscriptReplay,
+	type HostPromptSources,
 } from "./prompt.ts";
 import { projectPiTools } from "./tools.ts";
 
 export const AGY_ACP_PROVIDER_ID = "agy-acp";
 export const AGY_ACP_API = "agy-acp";
+/** Agent definition and prompt ownership changed; old ACP sessions must not resume. */
+export const ACP_CONFIGURATION_VERSION = 2;
 
 const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 const DEFAULT_PARK_BATCH_MS = 10;
 const DEFAULT_AUX_IDLE_MS = 60_000;
 
 export interface PersistedAcpBinding {
+	configurationVersion?: number;
 	piSessionId: string;
 	acpSessionId: string;
 	syncedFingerprint: string;
@@ -68,6 +73,7 @@ export interface SessionSyncContext {
 }
 
 export interface AgyAcpProviderOptions {
+	getPromptSources?: () => HostPromptSources | undefined;
 	cacheDir: string;
 	binaryPath?: string;
 	parkBatchMs?: number;
@@ -699,6 +705,11 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 
 		const { result } = phase;
 		message.usage = normalizeTurnUsage(model, result.usage, bridge.latestUsageUpdate, bridge.stepCount);
+		const terminalError = terminalAcpError(message, result);
+		if (terminalError) {
+			writer.fail("error", terminalError);
+			return;
+		}
 		finishFromStopReason(writer, result.stopReason);
 
 		if (result.stopReason === "end_turn" || result.stopReason === "max_tokens" || result.stopReason === "max_turn_requests") {
@@ -708,6 +719,7 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 			}
 			if (activePiSessionId) {
 				const binding: PersistedAcpBinding = {
+					configurationVersion: ACP_CONFIGURATION_VERSION,
 					piSessionId: activePiSessionId,
 					acpSessionId: bridge.sessionId,
 					syncedFingerprint,
@@ -744,7 +756,13 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 			writer.fail("error", "No prompt content to send to Antigravity ACP.");
 			return;
 		}
-		const systemPrompt = renderSystemPromptAppend(context.messages, log);
+		let systemPrompt: string;
+		try {
+			systemPrompt = renderSystemPromptAppend(context.messages, log);
+		} catch (error) {
+			writer.fail("error", errorMessage(error));
+			return;
+		}
 		const transport = acquireAuxTransport();
 		let sessionId: string | undefined;
 		let latestUsageUpdate: { used: number; size: number } | null = null;
@@ -786,7 +804,9 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 			});
 			log(`aux raw ACP usage sid=${sessionId}: ${JSON.stringify(result.usage ?? null)}`);
 			message.usage = normalizeTurnUsage(model, result.usage, latestUsageUpdate, 1);
-			finishFromStopReason(writer, result.stopReason);
+			const terminalError = terminalAcpError(message, result);
+			if (terminalError) writer.fail("error", terminalError);
+			else finishFromStopReason(writer, result.stopReason);
 		} catch (error) {
 			if (signal?.aborted) writer.fail("aborted", "Request was aborted");
 			else writer.fail("error", errorMessage(error));
@@ -880,8 +900,16 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 		}
 
 		// Case 2: Start a fresh ACP prompt turn (reusing/resuming warm session if continuity matches).
-		const systemPrompt = renderSystemPromptAppend(context.messages, log);
-		const systemPromptHash = hashSystemPromptAppend(context.messages);
+		let systemPrompt: string;
+		let systemPromptHash: string;
+		try {
+			const sources = options.getPromptSources?.();
+			systemPrompt = renderSystemPromptAppend(context.messages, log, sources);
+			systemPromptHash = hashSystemPromptAppend(context.messages, sources);
+		} catch (error) {
+			writer.fail("error", errorMessage(error));
+			return;
+		}
 		const projectedTools = projectPiTools(getCurrentTools(context.messages));
 
 		let transport: AcpTransport;
@@ -1157,6 +1185,9 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 			abandonParkedTurn("Pi switched session or branch.");
 			activePiSessionId = ctx.piSessionId;
 			activeCwd = ctx.cwd;
+			if (ctx.persistedBinding?.configurationVersion !== ACP_CONFIGURATION_VERSION) {
+				ctx = { ...ctx, persistedBinding: undefined };
+			}
 			if (ctx.isFork) {
 				boundSession = null;
 				persistedBinding = undefined;

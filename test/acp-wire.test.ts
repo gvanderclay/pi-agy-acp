@@ -6,7 +6,21 @@ import {
 	parsePromptResult,
 	parseRpcMessage,
 	parseSessionUpdate,
+	piToolPermission,
 } from "../src/acp-wire.ts";
+
+test("permission responses authorize only the Pi MCP bridge and only once", () => {
+	const request = (name: string) => ({ toolCall: { name }, options: [
+		{ kind: "allow_always", optionId: "always" }, { kind: "allow_once", optionId: "once" },
+	] });
+	assert.deepEqual(piToolPermission(request("mcp_pi-tools_codemode"), true), { outcome: { outcome: "selected", optionId: "once" } });
+	for (const name of ["run_command", "read_file", "manage_task", "mcp_other_shell", "mcp_pi-tools-spoof"]) {
+		assert.deepEqual(piToolPermission(request(name), true), { outcome: { outcome: "cancelled" } });
+	}
+	assert.deepEqual(piToolPermission(request("mcp_pi-tools_codemode"), false), { outcome: { outcome: "cancelled" } });
+	assert.deepEqual(piToolPermission({ ...request("mcp_pi-tools_codemode"), options: [{ kind: "allow_always", optionId: "always" }] }, true), { outcome: { outcome: "cancelled" } });
+	assert.deepEqual(piToolPermission(null, true), { outcome: { outcome: "cancelled" } });
+});
 
 test("parseRpcMessage classifies request, notification, success response, and error response", () => {
 	assert.deepEqual(parseRpcMessage({ jsonrpc: "2.0", id: 1, method: "ping", params: { ok: true } }), {
