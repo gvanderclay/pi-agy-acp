@@ -81,3 +81,22 @@ export function terminalAcpError(message: AssistantMessage, result: AcpPromptRes
 	const warning = /^⚠\uFE0F?\s*(?:(?:API error \(attempt \d+\):\s*)?(?:RESOURCE_EXHAUSTED|UNAVAILABLE|INTERNAL|DEADLINE_EXCEEDED|UNAUTHENTICATED|PERMISSION_DENIED|INVALID_ARGUMENT) \(code \d+\): .+|.*[Qq]uota reached.*)$/;
 	return lines.length > 0 && lines.every((line) => warning.test(line.trim())) ? text : undefined;
 }
+
+/**
+ * Detects a silent blank `end_turn` (no visible text or tool calls, and no
+ * generated output tokens) so Pi/Squire treats it as a failure instead of a
+ * completed turn.
+ */
+export function blankAcpTurnError(
+	message: AssistantMessage,
+	result: AcpPromptResult,
+	stepCount: number,
+): string | undefined {
+	if (result.stopReason !== "end_turn" || stepCount > 1) return undefined;
+	const hasVisible = message.content.some(
+		(part) => (part.type === "text" && part.text.trim().length > 0) || part.type === "toolCall",
+	);
+	if (hasVisible) return undefined;
+	if (result.usage && result.usage.outputTokens > 0) return undefined;
+	return "Antigravity ended the turn without visible output.";
+}

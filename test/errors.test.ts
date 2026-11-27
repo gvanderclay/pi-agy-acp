@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import type { AssistantMessage } from "@earendil-works/pi-ai";
-import { terminalAcpError, WarningLineFilter } from "../src/errors.ts";
+import { blankAcpTurnError, terminalAcpError, WarningLineFilter } from "../src/errors.ts";
 import type { AcpPromptResult } from "../src/acp-wire.ts";
 
 const warning = "⚠ RESOURCE_EXHAUSTED (code 429): Individual quota reached. Resets in 1h11m59s.";
@@ -49,4 +49,14 @@ test("WarningLineFilter suppresses final quota warning lines while letting norma
 	assert.equal(proseFilter.push("text", "⚠ Check the file before editing.", emitProse), undefined);
 	assert.equal(proseFilter.finish(emitProse), undefined);
 	assert.equal(proseEmitted.join(""), "⚠ Check the file before editing.");
+});
+
+test("blankAcpTurnError rejects empty zero-output end_turn while allowing text, multi-step, or non-zero output", () => {
+	const empty = { content: [] } as unknown as AssistantMessage;
+	const zeroUsageResult: AcpPromptResult = { stopReason: "end_turn", usage: { inputTokens: 100, outputTokens: 0, thoughtTokens: 0, cachedReadTokens: 0, cachedWriteTokens: 0, totalTokens: 100 } };
+	assert.match(blankAcpTurnError(empty, zeroUsageResult, 1) ?? "", /without visible output/);
+	assert.match(blankAcpTurnError(empty, { stopReason: "end_turn", usage: undefined }, 1) ?? "", /without visible output/);
+	assert.equal(blankAcpTurnError(message("Done."), zeroUsageResult, 1), undefined);
+	assert.equal(blankAcpTurnError(empty, zeroUsageResult, 2), undefined);
+	assert.equal(blankAcpTurnError(empty, { stopReason: "cancelled", usage: undefined }, 1), undefined);
 });

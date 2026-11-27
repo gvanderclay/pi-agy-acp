@@ -404,7 +404,9 @@ export class AgyAcpClient implements AcpTransport {
 		proc.on("error", (error: NodeJS.ErrnoException) => {
 			this.close(conn, new Error(`Failed to start agy acp ('${binary}'): ${error.message}`));
 		});
-		proc.on("exit", (code, signal) => {
+		// Use `close` (after stdout drains) rather than `exit` so a final JSON-RPC
+		// error response emitted right before process exit is still delivered.
+		proc.on("close", (code, signal) => {
 			this.close(conn, new Error(`agy acp exited unexpectedly (code ${code}, signal ${signal})`));
 		});
 		return conn;

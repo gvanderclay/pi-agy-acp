@@ -41,7 +41,7 @@ import {
 } from "./acp-wire.ts";
 import { DEFAULT_SYSTEM_PROMPT_SECTIONS, selectMcpTools } from "./config.ts";
 import { defaultConversationStore, type ConversationStore } from "./conversation-store.ts";
-import { terminalAcpError, WarningLineFilter } from "./errors.ts";
+import { blankAcpTurnError, terminalAcpError, WarningLineFilter } from "./errors.ts";
 import { GATE_URL_ENV, GateServer, installHook, type GateRequest, type HookDecision, type HookToolCall } from "./hook-gate.ts";
 import {
 	isOwnMcpToolName,
@@ -1068,7 +1068,7 @@ export function createAgyNativeProvider(options: AgyNativeProviderOptions): AgyN
 			writer.fail("error", heldQuotaError);
 			return;
 		}
-		const terminalError = terminalAcpError(message, result);
+		const terminalError = terminalAcpError(message, result) ?? blankAcpTurnError(message, result, bridge.stepCount);
 		if (terminalError) {
 			writer.fail("error", terminalError);
 			return;
@@ -1413,7 +1413,7 @@ export function createAgyNativeProvider(options: AgyNativeProviderOptions): AgyN
 					writer.fail("error", heldQuotaError);
 					return;
 				}
-				const terminalError = terminalAcpError(message, result);
+				const terminalError = terminalAcpError(message, result) ?? blankAcpTurnError(message, result, 1);
 				if (terminalError) writer.fail("error", terminalError);
 				else finishFromStopReason(writer, result.stopReason);
 			} finally {

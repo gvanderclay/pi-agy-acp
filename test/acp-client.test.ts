@@ -39,3 +39,31 @@ test("a signed-out Agy names the command that signs in Pi's Agy", async (t) => {
 		return true;
 	});
 });
+
+test("a final JSON-RPC error emitted right before process exit is delivered before close", async (t) => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-agy-acp-exit-"));
+	t.after(() => rmSync(dir, { recursive: true, force: true }));
+	const binaryPath = join(dir, "agy");
+	const exitAfterReply = `#!/usr/bin/env node
+let buffer = "";
+process.stdin.on("data", (chunk) => {
+	buffer += chunk;
+	let end;
+	while ((end = buffer.indexOf("\\n")) >= 0) {
+		const message = JSON.parse(buffer.slice(0, end));
+		buffer = buffer.slice(end + 1);
+		if (message.method === "initialize") {
+			process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, result: { protocolVersion: 1, agentCapabilities: {}, agentInfo: { name: "mock", version: "1.5.18" } } }) + "\\n");
+		} else {
+			process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: message.id, error: { code: -32001, message: "Fatal backend error before exit" } }) + "\\n", () => process.exit(1));
+		}
+	}
+});
+`;
+	writeFileSync(binaryPath, exitAfterReply);
+	chmodSync(binaryPath, 0o755);
+	const client = new AgyAcpClient({ binaryPath, geminiDir: join(dir, "agy-native") });
+	t.after(() => client.dispose());
+
+	await assert.rejects(client.createSession({ cwd: dir }), /Fatal backend error before exit/);
+});
