@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -62,6 +62,34 @@ test(
 			const reply = await handle.provider.streamSimple(model, side, { signal: new AbortController().signal }).result();
 			assert.equal(reply.stopReason, "stop", reply.errorMessage);
 			assert.match(reply.content.map((part) => (part.type === "text" ? part.text : "")).join(""), /PELICAN/);
+		} finally {
+			await handle.dispose();
+			rmSync(cacheDir, { recursive: true, force: true });
+		}
+	},
+);
+
+test(
+	"live agy acp: a side request's tool calls are recognised as its own and denied",
+	{ skip: !LIVE },
+	async () => {
+		const cacheDir = mkdtempSync(join(tmpdir(), "pi-agy-native-live-"));
+		const marker = join(cacheDir, "side-request-ran");
+		const logs: string[] = [];
+		const handle = createAgyNativeProvider({ cacheDir, log: (message) => logs.push(message) });
+		try {
+			handle.syncSession({ piSessionId: "live-pi-1", cwd: process.cwd() });
+			const model = handle.provider.getModels().find((m) => m.id === "gemini-4-neon")!;
+			const side = {
+				messages: [
+					createInitialSystemMessage("Use your shell tool exactly once, then reply with one sentence saying whether it ran.", [])!,
+					{ role: "user", content: `Run the shell command: touch ${marker}`, timestamp: Date.now() },
+				],
+			} as TranscriptContext;
+			const reply = await handle.provider.streamSimple(model, side, { signal: new AbortController().signal }).result();
+			assert.equal(reply.stopReason, "stop", reply.errorMessage);
+			assert.equal(existsSync(marker), false);
+			assert.ok(logs.some((line) => /^hook \S+ denied: side request$/.test(line)), logs.join("\n"));
 		} finally {
 			await handle.dispose();
 			rmSync(cacheDir, { recursive: true, force: true });
