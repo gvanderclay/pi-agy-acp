@@ -8,6 +8,7 @@ import { accessSync, constants as fsConstants } from "node:fs";
 import { delimiter, join } from "node:path";
 import { createInterface } from "node:readline";
 import {
+	ACP_AUTH_REQUIRED,
 	ACP_PROTOCOL_VERSION,
 	RPC_METHOD_NOT_FOUND,
 	isRecord,
@@ -205,6 +206,8 @@ interface PendingRequest {
 interface Connection {
 	proc: ChildProcessWithoutNullStreams;
 	sessions: Map<string, AcpSessionConfig>;
+	/** Signs in the Agy this connection runs, which keeps its own sign-in over SSH. */
+	signInCommand: string;
 }
 
 export class AgyAcpClient implements AcpTransport {
@@ -371,7 +374,7 @@ export class AgyAcpClient implements AcpTransport {
 			stdio: ["pipe", "pipe", "pipe"],
 		});
 
-		const conn: Connection = { proc, sessions: new Map() };
+		const conn: Connection = { proc, sessions: new Map(), signInCommand: [binary, ...args, "--login"].join(" ") };
 		this.conn = conn;
 		trackProcess(proc);
 
@@ -484,7 +487,13 @@ export class AgyAcpClient implements AcpTransport {
 		const entry = this.pending.get(message.id);
 		if (!entry) return;
 		if (message.outcome.ok) entry.resolve(message.outcome.result);
-		else entry.reject(new AcpRpcError(message.outcome.error.message, message.outcome.error.code));
+		else {
+			const { code } = message.outcome.error;
+			const text = code === ACP_AUTH_REQUIRED && this.conn
+				? `Antigravity is not signed in for Pi. Run: ${this.conn.signInCommand}`
+				: message.outcome.error.message;
+			entry.reject(new AcpRpcError(text, code));
+		}
 	}
 
 	private dispatchUpdate(params: unknown): void {
