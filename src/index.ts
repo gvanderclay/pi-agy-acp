@@ -14,7 +14,7 @@ import {
 	type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { loadAgyNativeConfig } from "./config.ts";
+import { loadAgyNativeConfig, selectMcpTools } from "./config.ts";
 import {
 	AGY_COMMAND_TOOL,
 	AGY_EDIT_TOOL,
@@ -90,7 +90,7 @@ export default function agyNativeExtension(pi: ExtensionAPI): void {
 			const active = new Set(pi.getActiveTools());
 			return pi
 				.getAllTools()
-				.filter((tool) => tool.exposure !== "hidden" && (active.has(tool.name) || tool.exposure === "deferred"));
+				.filter((tool) => tool.exposure !== "hidden" && active.has(tool.name));
 		},
 		getSystemPromptAppend: () =>
 			promptOptions ? agyRoleInstructions(promptOptions, config.systemPromptSections) : undefined,
@@ -186,8 +186,9 @@ export default function agyNativeExtension(pi: ExtensionAPI): void {
 	};
 	registerApprovalTools("hidden");
 	let exposed = false;
+	const activatedMcpTools = new Set<string>();
 
-	/** The approval tools run only for Agy; other models must not see them. */
+	/** The approval tools and projected deferred MCP tools run only for Agy; other models must not see them. */
 	const syncTools = (onAgy: boolean): void => {
 		if (exposed !== onAgy) {
 			exposed = onAgy;
@@ -195,11 +196,31 @@ export default function agyNativeExtension(pi: ExtensionAPI): void {
 		}
 		const active = new Set(pi.getActiveTools());
 		const before = active.size;
-		for (const name of AGY_TOOL_NAMES) {
-			if (onAgy) active.add(name);
-			else active.delete(name);
+		if (onAgy) {
+			for (const name of AGY_TOOL_NAMES) active.add(name);
+			const candidates = pi
+				.getAllTools()
+				.filter((tool) => tool.exposure !== "hidden" && (active.has(tool.name) || tool.exposure === "deferred"));
+			for (const tool of selectMcpTools(candidates, config.mcpTools)) {
+				if (!active.has(tool.name)) {
+					active.add(tool.name);
+					activatedMcpTools.add(tool.name);
+				}
+			}
+		} else {
+			for (const name of AGY_TOOL_NAMES) active.delete(name);
+			for (const name of activatedMcpTools) active.delete(name);
+			activatedMcpTools.clear();
 		}
-		if (active.size !== before) pi.setActiveTools([...active]);
+		if (active.size !== before) {
+			pi.setActiveTools([...active]);
+			if (onAgy && activatedMcpTools.size > 0) {
+				const applied = new Set(pi.getActiveTools());
+				for (const name of [...activatedMcpTools]) {
+					if (!applied.has(name)) activatedMcpTools.delete(name);
+				}
+			}
+		}
 	};
 	const onAgy = (ctx: ExtensionContext): boolean => ctx.model?.provider === AGY_PROVIDER_ID;
 
@@ -239,8 +260,9 @@ export default function agyNativeExtension(pi: ExtensionAPI): void {
 		};
 	});
 
-	pi.on("before_agent_start", (event) => {
+	pi.on("before_agent_start", (event, ctx) => {
 		promptOptions = event.systemPromptOptions;
+		syncTools(onAgy(ctx));
 	});
 
 	pi.on("context_with_system", (_event, ctx) => {
