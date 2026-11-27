@@ -803,6 +803,12 @@ export function createAgyNativeProvider(options: AgyNativeProviderOptions): AgyN
 
 	const ensureTransport = async (): Promise<AcpTransport> => {
 		if (transport) return transport;
+		try {
+			const swept = conversationStore.sweepStaleForks?.(options.geminiDir) ?? 0;
+			if (swept > 0) log(`swept ${swept} stale fork/checkpoint artifact(s)`);
+		} catch (error) {
+			log(`fork sweep skipped: ${errorMessage(error)}`);
+		}
 		(options.installGate ?? (() => installHook({
 				hooksPath: join(options.geminiDir, "config", "hooks.json"),
 				scriptPath: join(options.cacheDir, "pi-gate-hook.mjs"),

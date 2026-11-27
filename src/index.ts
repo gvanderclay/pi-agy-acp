@@ -88,7 +88,9 @@ export default function agyNativeExtension(pi: ExtensionAPI): void {
 		mcpToolPatterns: config.mcpTools,
 		getAvailableTools: () => {
 			const active = new Set(pi.getActiveTools());
-			return pi.getAllTools().filter((tool) => tool.exposure !== "hidden" && active.has(tool.name));
+			return pi
+				.getAllTools()
+				.filter((tool) => tool.exposure !== "hidden" && (active.has(tool.name) || tool.exposure === "deferred"));
 		},
 		getSystemPromptAppend: () =>
 			promptOptions ? agyRoleInstructions(promptOptions, config.systemPromptSections) : undefined,

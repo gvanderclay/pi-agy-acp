@@ -8,13 +8,14 @@
  */
 
 import { createHash, randomUUID } from "node:crypto";
-import { appendFileSync, readFileSync, rmSync } from "node:fs";
+import { appendFileSync, existsSync, readdirSync, readFileSync, rmSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { isRecord } from "./acp-wire.ts";
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const FINGERPRINT_PREFIX = "v1:";
+const DEFAULT_FORK_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 const REQUIRED_TABLES = ["trajectory_meta", "steps", "parent_references", "gen_metadata", "executor_metadata"] as const;
 const KNOWN_TABLES = new Set<string>([...REQUIRED_TABLES, "trajectory_metadata_blob", "battle_mode_infos"]);
 
@@ -28,6 +29,7 @@ export interface ConversationStore {
 	recordCheckpoint(geminiDir: string, acpSessionId: string, timestamp: number): ConversationCheckpoint | undefined;
 	forkConversation(geminiDir: string, sourceId: string, timestamp: number): string | undefined;
 	deleteConversation(geminiDir: string, id: string): void;
+	sweepStaleForks?(geminiDir: string, maxAgeMs?: number): number;
 }
 
 export function isNativeForkDisabled(): boolean {
@@ -240,7 +242,11 @@ export function forkConversationStore(geminiDir: string, sourceId: string, times
 			fork.close();
 		}
 
-		appendFileSync(`${target}.checkpoints`, `${JSON.stringify({ timestamp, checkpoint, fingerprint })}\n`, { mode: 0o600 });
+		appendFileSync(
+			`${target}.checkpoints`,
+			`${JSON.stringify({ timestamp, checkpoint, fingerprint, forked: true })}\n`,
+			{ mode: 0o600 },
+		);
 		return forkId;
 	} catch (error) {
 		deleteConversationFiles(geminiDir, forkId);
@@ -251,13 +257,75 @@ export function forkConversationStore(geminiDir: string, sourceId: string, times
 export function deleteConversationFiles(geminiDir: string, id: string): void {
 	if (!UUID.test(id)) return;
 	const store = conversationStorePath(geminiDir, id);
+	const appDir = join(geminiDir, "antigravity-cli");
 	for (const suffix of ["", "-wal", "-shm", ".checkpoints"]) {
 		rmSync(`${store}${suffix}`, { force: true });
 	}
+	rmSync(join(appDir, "brain", id), { recursive: true, force: true });
+	rmSync(join(appDir, "annotations", `${id}.pbtxt`), { force: true });
+}
+
+function isForkedCheckpointFile(path: string): boolean {
+	try {
+		const raw = readFileSync(path, "utf8");
+		for (const line of raw.split("\n")) {
+			const trimmed = line.trim();
+			if (!trimmed) continue;
+			const parsed: unknown = JSON.parse(trimmed);
+			if (isRecord(parsed) && parsed.forked === true) return true;
+		}
+	} catch {
+		// Unreadable sidecar; leave untouched.
+	}
+	return false;
+}
+
+/**
+ * Removes orphaned `.checkpoints` sidecars and stale forked conversation DBs
+ * older than `maxAgeMs` (default 30 days). Never deletes original (non-forked)
+ * conversations.
+ */
+export function sweepStaleForks(
+	geminiDir: string,
+	maxAgeMs = DEFAULT_FORK_MAX_AGE_MS,
+	now = Date.now(),
+): number {
+	const dir = join(geminiDir, "antigravity-cli", "conversations");
+	let entries: string[];
+	try {
+		entries = readdirSync(dir);
+	} catch {
+		return 0;
+	}
+	let removed = 0;
+	for (const entry of entries) {
+		if (!entry.endsWith(".db.checkpoints")) continue;
+		const id = entry.slice(0, -".db.checkpoints".length);
+		if (!UUID.test(id)) continue;
+		const checkpointPath = join(dir, entry);
+		const dbPath = join(dir, `${id}.db`);
+		if (!existsSync(dbPath)) {
+			rmSync(checkpointPath, { force: true });
+			removed++;
+			continue;
+		}
+		if (!isForkedCheckpointFile(checkpointPath)) continue;
+		try {
+			const ageMs = now - statSync(dbPath).mtimeMs;
+			if (ageMs >= maxAgeMs) {
+				deleteConversationFiles(geminiDir, id);
+				removed++;
+			}
+		} catch {
+			// Best effort.
+		}
+	}
+	return removed;
 }
 
 export const defaultConversationStore: ConversationStore = {
 	recordCheckpoint: recordConversationCheckpoint,
 	forkConversation: forkConversationStore,
 	deleteConversation: deleteConversationFiles,
+	sweepStaleForks,
 };

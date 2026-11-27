@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -10,6 +10,7 @@ import {
 	deleteConversationFiles,
 	forkConversationStore,
 	recordConversationCheckpoint,
+	sweepStaleForks,
 } from "../src/conversation-store.ts";
 
 function seedConversationDb(geminiDir: string, id: string): string {
@@ -119,6 +120,38 @@ test("forkConversationStore fails closed on prefix tamper or unsupported indexed
 		db2.exec("CREATE TABLE future_table (idx INTEGER PRIMARY KEY, data BLOB)");
 		db2.close();
 		assert.throws(() => recordConversationCheckpoint(dir, sourceId2, 200), /unsupported indexed table/);
+	} finally {
+		rmSync(dir, { recursive: true, force: true });
+	}
+});
+
+test("sweepStaleForks removes expired forks and orphaned checkpoints while keeping originals and fresh forks", () => {
+	const dir = mkdtempSync(join(tmpdir(), "pi-agy-conv-sweep-"));
+	try {
+		const sourceId = randomUUID();
+		const sourceDb = seedConversationDb(dir, sourceId);
+		recordConversationCheckpoint(dir, sourceId, 100);
+
+		const staleForkId = forkConversationStore(dir, sourceId, 100)!;
+		const freshForkId = forkConversationStore(dir, sourceId, 100)!;
+
+		// Backdate both the original source DB and the stale fork by 40 days.
+		const fortyDaysAgo = new Date(Date.now() - 40 * 24 * 60 * 60 * 1000);
+		utimesSync(sourceDb, fortyDaysAgo, fortyDaysAgo);
+		utimesSync(conversationStorePath(dir, staleForkId), fortyDaysAgo, fortyDaysAgo);
+
+		// Create an orphaned .checkpoints sidecar whose .db was deleted.
+		const orphanId = randomUUID();
+		const orphanDb = seedConversationDb(dir, orphanId);
+		recordConversationCheckpoint(dir, orphanId, 100);
+		rmSync(orphanDb);
+
+		const removed = sweepStaleForks(dir, 30 * 24 * 60 * 60 * 1000);
+		assert.equal(removed, 2);
+		assert.equal(existsSync(sourceDb), true);
+		assert.equal(existsSync(conversationStorePath(dir, freshForkId)), true);
+		assert.equal(existsSync(conversationStorePath(dir, staleForkId)), false);
+		assert.equal(existsSync(`${orphanDb}.checkpoints`), false);
 	} finally {
 		rmSync(dir, { recursive: true, force: true });
 	}
