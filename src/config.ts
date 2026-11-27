@@ -15,17 +15,25 @@ export const DEFAULT_SYSTEM_PROMPT_SECTIONS = ["squire_delegate_task"] as const;
 /** Built-in Pi file/shell tools that must never be projected; Agy uses its own stock tools. */
 const RESERVED_PI_TOOLS = new Set(["read", "write", "edit", "bash", "codemode"]);
 
+export type AgyPermissionsMode = "pi" | "agy";
+
 export interface AgyNativeConfig {
 	/** Glob patterns or exact Pi tool names to project to Agy via MCP. */
 	mcpTools: string[];
 	/** Pi system prompt section keys appended via `_meta.antigravity.systemPrompt.append`. */
 	systemPromptSections: string[];
+	/** Which permission engine governs Agy's built-in tools: Pi's `pi-gate` ("pi", default) or Agy's native permissions ("agy"). */
+	permissions: AgyPermissionsMode;
+	/** Pass `--sandbox` to `agy acp` to run terminal commands inside Agy's OS sandbox. */
+	sandbox: boolean;
 }
 
 export function defaultConfig(): AgyNativeConfig {
 	return {
 		mcpTools: [],
 		systemPromptSections: [...DEFAULT_SYSTEM_PROMPT_SECTIONS],
+		permissions: "pi",
+		sandbox: false,
 	};
 }
 
@@ -51,6 +59,8 @@ export function loadAgyNativeConfig(configPath: string, log?: (message: string) 
 		return {
 			mcpTools: stringList(parsed.mcpTools) ?? [],
 			systemPromptSections: stringList(parsed.systemPromptSections) ?? [...DEFAULT_SYSTEM_PROMPT_SECTIONS],
+			permissions: parsed.permissions === "agy" ? "agy" : "pi",
+			sandbox: parsed.sandbox === true,
 		};
 	} catch (error) {
 		log?.(`Failed to parse ${configPath}: ${error instanceof Error ? error.message : String(error)}`);

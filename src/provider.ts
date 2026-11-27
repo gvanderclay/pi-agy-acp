@@ -33,16 +33,25 @@ import { AgyAcpClient, resolveAgyBinary, type AcpMcpServerHttp, type AcpTranspor
 import {
 	isRecord,
 	type AcpChoice,
+	type AcpPermissionRequest,
 	type AcpPromptBlock,
 	type AcpPromptResult,
 	type AcpSessionConfig,
 	type AcpSessionUpdate,
 	type AcpUsage,
 } from "./acp-wire.ts";
-import { DEFAULT_SYSTEM_PROMPT_SECTIONS, selectMcpTools } from "./config.ts";
+import { DEFAULT_SYSTEM_PROMPT_SECTIONS, selectMcpTools, type AgyPermissionsMode } from "./config.ts";
 import { defaultConversationStore, type ConversationStore } from "./conversation-store.ts";
 import { blankAcpTurnError, terminalAcpError, WarningLineFilter } from "./errors.ts";
-import { GATE_URL_ENV, GateServer, installHook, type GateRequest, type HookDecision, type HookToolCall } from "./hook-gate.ts";
+import {
+	GATE_URL_ENV,
+	GateServer,
+	installHook,
+	uninstallHook,
+	type GateRequest,
+	type HookDecision,
+	type HookToolCall,
+} from "./hook-gate.ts";
 import {
 	isOwnMcpToolName,
 	MCP_SERVER_NAME,
@@ -132,11 +141,21 @@ export interface AgyNativeProviderOptions {
 	mcpToolPatterns?: readonly string[];
 	/** Returns active Pi tools eligible for selective MCP projection. */
 	getAvailableTools?: () => readonly Tool[];
+	/** Permission engine for Agy's built-in tools: Pi's `pi-gate` ("pi", default) or Agy's native engine ("agy"). */
+	permissions?: AgyPermissionsMode;
+	/** Pass `--sandbox` to `agy acp` to run terminal commands inside Agy's OS sandbox. */
+	sandbox?: boolean;
+	/** Handles Agy's `session/request_permission` prompts when `permissions === "agy"`. */
+	onPermissionRequest?: (
+		request: AcpPermissionRequest,
+		signal: AbortSignal | undefined,
+	) => boolean | string | Promise<boolean | string>;
 	/** Test seams. */
 	createTransport?: (env: Record<string, string>, onPermissionRequest: (toolCallId: string | undefined) => boolean) => AcpTransport;
 	conversationStore?: ConversationStore;
 	mcpServer?: McpBridgeServer;
 	installGate?: () => void;
+	uninstallGate?: () => void;
 	checkAvailable?: () => boolean;
 }
 
@@ -809,20 +828,38 @@ export function createAgyNativeProvider(options: AgyNativeProviderOptions): AgyN
 		} catch (error) {
 			log(`fork sweep skipped: ${errorMessage(error)}`);
 		}
-		(options.installGate ?? (() => installHook({
-				hooksPath: join(options.geminiDir, "config", "hooks.json"),
+		const useAgyPermissions = options.permissions === "agy";
+		const hooksPath = join(options.geminiDir, "config", "hooks.json");
+		let env: Record<string, string> = {};
+		const allowPiGatePermission = (toolCallId: string | undefined) =>
+			toolCallId !== undefined && approvedToolCalls.has(toolCallId);
+		if (useAgyPermissions) {
+			(options.uninstallGate ?? (() => uninstallHook(hooksPath)))();
+		} else {
+			(options.installGate ?? (() => installHook({
+				hooksPath,
 				scriptPath: join(options.cacheDir, "pi-gate-hook.mjs"),
 			})))();
-		const url = await gate.start();
-		const env = { [GATE_URL_ENV]: url };
-		const allowPermission = (toolCallId: string | undefined) => toolCallId !== undefined && approvedToolCalls.has(toolCallId);
+			const url = await gate.start();
+			env = { [GATE_URL_ENV]: url };
+		}
+		const handleAgyPermission = async (request: AcpPermissionRequest): Promise<boolean | string> => {
+			if (request.sessionId !== undefined && sideSessions.has(request.sessionId)) return false;
+			const current = activeBridge;
+			if (!current || (request.sessionId && request.sessionId !== current.sessionId)) return false;
+			if (!options.onPermissionRequest) return false;
+			return await options.onPermissionRequest(request, current.promptController.signal);
+		};
 		transport = options.createTransport
-			? options.createTransport(env, allowPermission)
+			? options.createTransport(env, allowPiGatePermission)
 			: new AgyAcpClient({
 					binaryPath: options.binaryPath,
 					geminiDir: options.geminiDir,
+					sandbox: options.sandbox,
 					env,
-					onPermissionRequest: (request) => allowPermission(request.toolCallId),
+					onPermissionRequest: useAgyPermissions
+						? handleAgyPermission
+						: (request) => allowPiGatePermission(request.toolCallId),
 					log: (msg) => log(`acp: ${msg}`),
 				});
 		return transport;

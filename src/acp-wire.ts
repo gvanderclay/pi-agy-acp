@@ -16,28 +16,55 @@ const optionalString = (value: unknown): string | undefined => (typeof value ===
 const optionalNumber = (value: unknown): number | undefined =>
 	typeof value === "number" && Number.isFinite(value) ? value : undefined;
 
+export interface AcpPermissionOption {
+	optionId: string;
+	name: string;
+	kind: string;
+}
+
 export interface AcpPermissionRequest {
 	sessionId: string | undefined;
 	toolCallId: string | undefined;
 	title: string | undefined;
+	kind: string | undefined;
+	rawInput: unknown;
+	options: AcpPermissionOption[];
 }
 
 export function parsePermissionRequest(params: unknown): AcpPermissionRequest {
 	const record = isRecord(params) ? params : {};
 	const toolCall = isRecord(record.toolCall) ? record.toolCall : {};
+	const rawOptions = Array.isArray(record.options) ? record.options : [];
+	const options = rawOptions.flatMap((option): AcpPermissionOption[] => {
+		if (!isRecord(option) || typeof option.optionId !== "string") return [];
+		return [{
+			optionId: option.optionId,
+			name: optionalString(option.name) ?? option.optionId,
+			kind: optionalString(option.kind) ?? "",
+		}];
+	});
 	return {
 		sessionId: optionalString(record.sessionId),
 		toolCallId: optionalString(toolCall.toolCallId),
 		title: optionalString(toolCall.title),
+		kind: optionalString(toolCall.kind),
+		rawInput: toolCall.rawInput,
+		options,
 	};
 }
 
-/** Answers `session/request_permission` with the first option of the wanted kind, else cancels. */
-export function permissionOutcome(params: unknown, allow: boolean): {
+/** Answers `session/request_permission` with an explicit optionId, or the first option of the wanted kind, else cancels. */
+export function permissionOutcome(params: unknown, decision: boolean | string): {
 	outcome: { outcome: "selected"; optionId: string } | { outcome: "cancelled" };
 } {
 	const options = isRecord(params) && Array.isArray(params.options) ? params.options : [];
-	const wanted = allow ? "allow_once" : "reject_once";
+	if (typeof decision === "string") {
+		const exact = options.find((candidate: unknown) => isRecord(candidate) && candidate.optionId === decision);
+		return isRecord(exact)
+			? { outcome: { outcome: "selected", optionId: decision } }
+			: { outcome: { outcome: "cancelled" } };
+	}
+	const wanted = decision ? "allow_once" : "reject_once";
 	const option: unknown = options.find((candidate: unknown) =>
 		isRecord(candidate) && candidate.kind === wanted && typeof candidate.optionId === "string");
 	return isRecord(option) && typeof option.optionId === "string"

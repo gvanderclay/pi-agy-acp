@@ -30,7 +30,7 @@ import {
 	type AgyTurnMark,
 	type SessionView,
 } from "./provider.ts";
-import { isRecord } from "./acp-wire.ts";
+import { isRecord, type AcpPermissionRequest } from "./acp-wire.ts";
 
 /** Agy sessions a forked Pi session must not continue; the session it was forked from owns them. */
 const RETIRED_ENTRY_TYPE = "agy-native-retired";
@@ -74,11 +74,29 @@ export default function agyNativeExtension(pi: ExtensionAPI): void {
 	const cacheDir = join(getAgentDir(), "cache", "agy-native");
 	const log = process.env.PI_AGY_ACP_DEBUG === "1" ? createDebugLogger(cacheDir) : undefined;
 	const config = loadAgyNativeConfig(join(getAgentDir(), "agy-native.json"), log);
-	log?.(`Loaded provider from ${import.meta.url} (mcpTools=${config.mcpTools.length})`);
+	log?.(`Loaded provider from ${import.meta.url} (mcpTools=${config.mcpTools.length}, permissions=${config.permissions}, sandbox=${config.sandbox})`);
 
 	let session: ExtensionContext | undefined;
 	// The run's prompt options; handlers that run after this one still edit the same object.
 	let promptOptions: BuildSystemPromptOptions | undefined;
+
+	const promptAgyPermission = async (
+		request: AcpPermissionRequest,
+		signal: AbortSignal | undefined,
+	): Promise<boolean | string> => {
+		const ctx = session;
+		if (!ctx?.hasUI) return false;
+		const title = request.title?.trim() || (request.kind ? `Agy permission: ${request.kind}` : "Agy permission request");
+		if (request.options.length > 0) {
+			const labels = request.options.map((option) => option.name);
+			const chosen = await ctx.ui.select(title, labels, { signal });
+			if (chosen === undefined) return false;
+			const match = request.options.find((option) => option.name === chosen);
+			return match?.optionId ?? false;
+		}
+		const detail = request.rawInput !== undefined ? JSON.stringify(request.rawInput) : title;
+		return await ctx.ui.confirm(title, detail, { signal });
+	};
 
 	const handle = createAgyNativeProvider({
 		cacheDir,
@@ -86,6 +104,9 @@ export default function agyNativeExtension(pi: ExtensionAPI): void {
 		log,
 		notify: (message) => session?.ui.notify(message, "warning"),
 		mcpToolPatterns: config.mcpTools,
+		permissions: config.permissions,
+		sandbox: config.sandbox,
+		onPermissionRequest: promptAgyPermission,
 		getAvailableTools: () => {
 			const active = new Set(pi.getActiveTools());
 			return pi
@@ -188,16 +209,19 @@ export default function agyNativeExtension(pi: ExtensionAPI): void {
 	let exposed = false;
 	const activatedMcpTools = new Set<string>();
 
-	/** The approval tools and projected deferred MCP tools run only for Agy; other models must not see them. */
+	/** The approval tools (in Pi permission mode) and projected deferred MCP tools run only for Agy. */
 	const syncTools = (onAgy: boolean): void => {
-		if (exposed !== onAgy) {
-			exposed = onAgy;
-			registerApprovalTools(onAgy ? "direct" : "hidden");
+		const exposeApproval = onAgy && config.permissions === "pi";
+		if (exposed !== exposeApproval) {
+			exposed = exposeApproval;
+			registerApprovalTools(exposeApproval ? "direct" : "hidden");
 		}
 		const active = new Set(pi.getActiveTools());
 		const before = active.size;
 		if (onAgy) {
-			for (const name of AGY_TOOL_NAMES) active.add(name);
+			if (exposeApproval) {
+				for (const name of AGY_TOOL_NAMES) active.add(name);
+			}
 			const candidates = pi
 				.getAllTools()
 				.filter((tool) => tool.exposure !== "hidden" && (active.has(tool.name) || tool.exposure === "deferred"));

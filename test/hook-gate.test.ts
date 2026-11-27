@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { GATE_URL_ENV, GateServer, HOOK_ENTRY_NAME, installHook } from "../src/hook-gate.ts";
+import { GATE_URL_ENV, GateServer, HOOK_ENTRY_NAME, installHook, uninstallHook } from "../src/hook-gate.ts";
 
 function tempDir(t: { after: (fn: () => void) => void }): string {
 	const dir = mkdtempSync(join(tmpdir(), "pi-agy-gate-"));
@@ -41,6 +41,10 @@ test("installHook adds the pi-gate entry, keeps other entries and leaves an inst
 	const written = statSync(hooksPath).mtimeMs;
 	installHook({ hooksPath, scriptPath });
 	assert.equal(statSync(hooksPath).mtimeMs, written);
+
+	uninstallHook(hooksPath);
+	const afterUninstall = JSON.parse(readFileSync(hooksPath, "utf8"));
+	assert.deepEqual(afterUninstall, { "workmux-status": { Stop: [] } });
 });
 
 test("the hook allows calls from an Agy that Pi did not start", async (t) => {

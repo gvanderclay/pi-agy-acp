@@ -20,11 +20,15 @@ test("loadAgyNativeConfig returns defaults when absent and parses valid override
 			JSON.stringify({
 				mcpTools: ["delegate", "delegation_*", "session_mail_*"],
 				systemPromptSections: ["squire_delegate_task", "squire_parent_delegation"],
+				permissions: "agy",
+				sandbox: true,
 			}),
 		);
 		assert.deepEqual(loadAgyNativeConfig(file), {
 			mcpTools: ["delegate", "delegation_*", "session_mail_*"],
 			systemPromptSections: ["squire_delegate_task", "squire_parent_delegation"],
+			permissions: "agy",
+			sandbox: true,
 		});
 	} finally {
 		rmSync(dir, { recursive: true, force: true });

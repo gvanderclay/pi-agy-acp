@@ -16,6 +16,8 @@ test("permission answers pick a one-time option and never an always option", () 
 	] };
 	assert.deepEqual(permissionOutcome(request, true), { outcome: { outcome: "selected", optionId: "once" } });
 	assert.deepEqual(permissionOutcome(request, false), { outcome: { outcome: "selected", optionId: "no" } });
+	assert.deepEqual(permissionOutcome(request, "always"), { outcome: { outcome: "selected", optionId: "always" } });
+	assert.deepEqual(permissionOutcome(request, "unknown"), { outcome: { outcome: "cancelled" } });
 	assert.deepEqual(permissionOutcome({ options: [{ kind: "allow_always", optionId: "always" }] }, true), { outcome: { outcome: "cancelled" } });
 	assert.deepEqual(permissionOutcome(null, true), { outcome: { outcome: "cancelled" } });
 });

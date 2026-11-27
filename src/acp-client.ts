@@ -102,10 +102,12 @@ export interface AgyAcpClientOptions {
 	binaryPath?: string;
 	/** Passed as `--gemini-dir`: where Agy keeps its config and conversations instead of `~/.gemini`. */
 	geminiDir?: string;
+	/** Pass `--sandbox` to `agy acp` to run terminal commands inside Agy's OS sandbox. */
+	sandbox?: boolean;
 	/** Added to the environment `agy acp` and its hooks inherit. */
 	env?: Record<string, string>;
-	/** Decides Agy's `session/request_permission` requests; returns true to allow once. */
-	onPermissionRequest?: (request: AcpPermissionRequest) => boolean;
+	/** Decides Agy's `session/request_permission` requests; returns an optionId or boolean (true to allow once). */
+	onPermissionRequest?: (request: AcpPermissionRequest) => boolean | string | Promise<boolean | string>;
 	handshakeTimeoutMs?: number;
 	log?: (message: string) => void;
 }
@@ -380,14 +382,17 @@ export class AgyAcpClient implements AcpTransport {
 				"Antigravity CLI ('agy') was not found on PATH. Install it or set PI_AGY_ACP_BIN to its path.",
 			);
 		}
-		const args = this.options.geminiDir ? ["acp", "--gemini-dir", this.options.geminiDir] : ["acp"];
+		const args = ["acp"];
+		if (this.options.geminiDir) args.push("--gemini-dir", this.options.geminiDir);
+		if (this.options.sandbox) args.push("--sandbox");
 		const proc = spawn(binary, args, {
 			env: { ...process.env, ...this.options.env },
 			detached: !IS_WINDOWS,
 			stdio: ["pipe", "pipe", "pipe"],
 		});
 
-		const conn: Connection = { proc, sessions: new Map(), signInCommand: [binary, ...args, "--login"].join(" ") };
+		const signInArgs = this.options.geminiDir ? ["acp", "--gemini-dir", this.options.geminiDir, "--login"] : ["acp", "--login"];
+		const conn: Connection = { proc, sessions: new Map(), signInCommand: [binary, ...signInArgs].join(" ") };
 		this.conn = conn;
 		trackProcess(proc);
 
@@ -478,9 +483,16 @@ export class AgyAcpClient implements AcpTransport {
 		if (message.kind === "request") {
 			if (message.method === "session/request_permission") {
 				const request = parsePermissionRequest(message.params);
-				const allow = this.options.onPermissionRequest?.(request) ?? false;
-				this.log(`permission request ${request.toolCallId ?? "?"} (${request.title ?? "?"}) -> ${allow ? "allow" : "reject"}`);
-				this.write({ jsonrpc: "2.0", id: message.id, result: permissionOutcome(message.params, allow) });
+				const conn = this.conn;
+				void Promise.resolve()
+					.then(() => this.options.onPermissionRequest?.(request) ?? false)
+					.catch(() => false)
+					.then((decision) => {
+						if (this.conn !== conn) return;
+						const label = typeof decision === "string" ? decision : decision ? "allow" : "reject";
+						this.log(`permission request ${request.toolCallId ?? "?"} (${request.title ?? "?"}) -> ${label}`);
+						this.write({ jsonrpc: "2.0", id: message.id, result: permissionOutcome(message.params, decision) });
+					});
 				return;
 			}
 			this.write({

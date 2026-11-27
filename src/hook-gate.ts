@@ -118,6 +118,22 @@ export function installHook(options: HookInstallOptions): void {
 	writeFileSync(hooksPath, `${JSON.stringify({ ...config, [HOOK_ENTRY_NAME]: entry }, null, 2)}\n`);
 }
 
+/** Removes the `pi-gate` entry from hooks.json while preserving every other entry. */
+export function uninstallHook(hooksPath: string): void {
+	let raw: string;
+	try {
+		raw = readFileSync(hooksPath, "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+		throw error;
+	}
+	if (raw.trim() === "") return;
+	const config: unknown = JSON.parse(raw);
+	if (!isRecord(config) || !(HOOK_ENTRY_NAME in config)) return;
+	const { [HOOK_ENTRY_NAME]: _removed, ...rest } = config;
+	writeFileSync(hooksPath, `${JSON.stringify(rest, null, 2)}\n`);
+}
+
 export interface GateRequest {
 	call: HookToolCall;
 	/** Settles when Agy stops waiting (hook killed or connection closed) before an answer. */
