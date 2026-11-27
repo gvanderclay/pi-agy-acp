@@ -10,7 +10,9 @@ tool calls may run.
 1. **Stock Agy.** The provider starts `agy acp --gemini-dir ~/.pi/agent/agy-native`
    and an honest `clientInfo`. Pi's Agy keeps its own settings, hooks,
    skills, MCP servers and conversations in that folder, apart from the Agy
-   you run in a terminal (`~/.gemini`); sign-in is shared. A repo's own
+   you run in a terminal (`~/.gemini`). A local sign-in is shared through
+   the system keyring; over SSH, Agy keeps it in a file in that folder, so
+   Pi's Agy needs its own sign-in (see [Requirements](#requirements)). A repo's own
    `AGENTS.md` and `.agents/` still load. It sends no tools. Of Pi's
    system prompt it sends only the role instructions, appended to Agy's own
    prompt through `_meta.antigravity.systemPrompt.append` on every
@@ -61,7 +63,12 @@ reported for cost.
 ## Requirements
 
 - Antigravity CLI (`agy` 1.5.18) installed and signed in, on `PATH` or set in
-  `PI_AGY_ACP_BIN`.
+  `PI_AGY_ACP_BIN`. Signing in with `agy` on the machine itself covers Pi.
+  Over SSH (tmux inside SSH too), sign Pi's Agy in separately:
+
+  ```sh
+  agy acp --gemini-dir ~/.pi/agent/agy-native --login
+  ```
 - Pi `>= 1.6.0` on Node `>= 22.19.0`.
 
 ## Installation
