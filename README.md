@@ -7,18 +7,21 @@ tool calls may run.
 
 ## How it works
 
-1. **Stock Agy.** The provider starts `agy acp` with your own Antigravity
-   configuration and an honest `clientInfo`. It sends no tools. Of Pi's
+1. **Stock Agy.** The provider starts `agy acp --gemini-dir ~/.pi/agent/agy-native`
+   and an honest `clientInfo`. Pi's Agy keeps its own settings, hooks,
+   skills, MCP servers and conversations in that folder, apart from the Agy
+   you run in a terminal (`~/.gemini`); sign-in is shared. A repo's own
+   `AGENTS.md` and `.agents/` still load. It sends no tools. Of Pi's
    system prompt it sends only the role instructions, appended to Agy's own
    prompt through `_meta.antigravity.systemPrompt.append` on every
    `session/new` and `session/resume`: the `--append-system-prompt` text
    and Squire's `squire_delegate_task` section. A normal Pi session has
    neither, so Agy runs with its stock prompt.
 2. **Every Agy tool call goes through Pi.** On first use the provider adds a
-   `pi-gate` `PreToolUse` entry to `~/.gemini/config/hooks.json` (other entries
-   are kept) that runs `~/.pi/agent/cache/agy-native/pi-gate-hook.mjs`. The
-   script asks the Pi session that started this `agy acp`. An Agy started
-   outside Pi gets `allow` and keeps its own permission flow.
+   `pi-gate` `PreToolUse` entry to `~/.pi/agent/agy-native/config/hooks.json`
+   (other entries are kept) that runs
+   `~/.pi/agent/cache/agy-native/pi-gate-hook.mjs`. The script asks the Pi
+   session that started this `agy acp`; run without one, it answers `allow`.
 3. **Approval tool calls.** Pi sees each Agy tool call as a tool call of its
    own, so pi-permission-system, auto-mode and the approval dialog apply:
    - `run_command` → `agy_command { command, cwd }` (configure it as a shell

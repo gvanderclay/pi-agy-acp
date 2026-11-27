@@ -1,7 +1,7 @@
 /**
  * The Agy `PreToolUse` hook that routes every Agy tool call through Pi.
  *
- * Agy runs hooks from the global `~/.gemini/config/hooks.json` under `agy acp`
+ * Agy runs hooks from `<gemini dir>/config/hooks.json` under `agy acp`
  * (https://antigravity.google/docs/hooks.md). The `pi-gate` entry runs a small
  * script that posts the hook input to the address in `PI_AGY_GATE_URL`, which
  * the provider sets only for the `agy acp` it starts. Agy started outside Pi
@@ -11,15 +11,13 @@
 import { randomBytes } from "node:crypto";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
-import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname } from "node:path";
 import { isRecord } from "./acp-wire.ts";
 
 export const GATE_URL_ENV = "PI_AGY_GATE_URL";
 export const HOOK_ENTRY_NAME = "pi-gate";
 /** Agy waits this many seconds for the hook; the provider answers well before. */
 export const HOOK_TIMEOUT_SECONDS = 3600;
-export const DEFAULT_HOOKS_PATH = join(homedir(), ".gemini", "config", "hooks.json");
 
 export const HOOK_SCRIPT = `// Installed by pi-agy-acp. Posts Agy's PreToolUse input to the Pi session
 // that started this agy acp process, and prints Pi's decision.
@@ -80,14 +78,14 @@ function hookCommand(nodePath: string, scriptPath: string): string {
 }
 
 export interface HookInstallOptions {
-	hooksPath?: string;
+	hooksPath: string;
 	scriptPath: string;
 	nodePath?: string;
 }
 
 /** Writes the hook script and the `pi-gate` entry, keeping every other entry in hooks.json. */
 export function installHook(options: HookInstallOptions): void {
-	const hooksPath = options.hooksPath ?? DEFAULT_HOOKS_PATH;
+	const { hooksPath } = options;
 	mkdirSync(dirname(options.scriptPath), { recursive: true, mode: 0o700 });
 	let currentScript: string | undefined;
 	try {

@@ -22,7 +22,7 @@ test(
 	{ skip: !LIVE },
 	async () => {
 		const cacheDir = mkdtempSync(join(tmpdir(), "pi-agy-native-live-"));
-		const handle = createAgyNativeProvider({ cacheDir });
+		const handle = createAgyNativeProvider({ cacheDir, geminiDir: join(cacheDir, "gemini") });
 		try {
 			handle.syncSession({ piSessionId: "live-pi-1", cwd: process.cwd() });
 			const model = handle.provider.getModels().find((m) => m.id === "gemini-4-neon")!;
@@ -39,7 +39,8 @@ test(
 			assert.equal(done.stopReason, "stop", done.errorMessage);
 		} finally {
 			await handle.dispose();
-			rmSync(cacheDir, { recursive: true, force: true });
+			// agy may still be writing to its gemini dir for a moment after SIGTERM.
+			rmSync(cacheDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
 		}
 	},
 );
@@ -51,6 +52,7 @@ test(
 		const cacheDir = mkdtempSync(join(tmpdir(), "pi-agy-native-live-"));
 		const handle = createAgyNativeProvider({
 			cacheDir,
+			geminiDir: join(cacheDir, "gemini"),
 			getSystemPromptAppend: () => "When asked for your role code, reply with only the word HERON-5528.",
 		});
 		try {
@@ -62,7 +64,8 @@ test(
 			assert.match(reply.content.map((part) => (part.type === "text" ? part.text : "")).join(""), /HERON-5528/);
 		} finally {
 			await handle.dispose();
-			rmSync(cacheDir, { recursive: true, force: true });
+			// agy may still be writing to its gemini dir for a moment after SIGTERM.
+			rmSync(cacheDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
 		}
 	},
 );
@@ -72,7 +75,7 @@ test(
 	{ skip: !LIVE },
 	async () => {
 		const cacheDir = mkdtempSync(join(tmpdir(), "pi-agy-native-live-"));
-		const handle = createAgyNativeProvider({ cacheDir });
+		const handle = createAgyNativeProvider({ cacheDir, geminiDir: join(cacheDir, "gemini") });
 		try {
 			handle.syncSession({ piSessionId: "live-pi-1", cwd: process.cwd() });
 			const model = handle.provider.getModels().find((m) => m.id === "gemini-4-neon")!;
@@ -87,7 +90,8 @@ test(
 			assert.match(reply.content.map((part) => (part.type === "text" ? part.text : "")).join(""), /PELICAN/);
 		} finally {
 			await handle.dispose();
-			rmSync(cacheDir, { recursive: true, force: true });
+			// agy may still be writing to its gemini dir for a moment after SIGTERM.
+			rmSync(cacheDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
 		}
 	},
 );
@@ -99,7 +103,7 @@ test(
 		const cacheDir = mkdtempSync(join(tmpdir(), "pi-agy-native-live-"));
 		const marker = join(cacheDir, "side-request-ran");
 		const logs: string[] = [];
-		const handle = createAgyNativeProvider({ cacheDir, log: (message) => logs.push(message) });
+		const handle = createAgyNativeProvider({ cacheDir, geminiDir: join(cacheDir, "gemini"), log: (message) => logs.push(message) });
 		try {
 			handle.syncSession({ piSessionId: "live-pi-1", cwd: process.cwd() });
 			const model = handle.provider.getModels().find((m) => m.id === "gemini-4-neon")!;
@@ -115,7 +119,8 @@ test(
 			assert.ok(logs.some((line) => /^hook \S+ denied: side request$/.test(line)), logs.join("\n"));
 		} finally {
 			await handle.dispose();
-			rmSync(cacheDir, { recursive: true, force: true });
+			// agy may still be writing to its gemini dir for a moment after SIGTERM.
+			rmSync(cacheDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
 		}
 	},
 );

@@ -80,6 +80,7 @@ export default function agyNativeExtension(pi: ExtensionAPI): void {
 
 	const handle = createAgyNativeProvider({
 		cacheDir,
+		geminiDir: join(getAgentDir(), "agy-native"),
 		log,
 		notify: (message) => session?.ui.notify(message, "warning"),
 		getSystemPromptAppend: () => (promptOptions ? agyRoleInstructions(promptOptions) : undefined),

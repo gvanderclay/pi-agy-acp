@@ -165,6 +165,7 @@ function setup(overrides: Partial<AgyNativeProviderOptions> = {}) {
 	const notices: string[] = [];
 	const handle = createAgyNativeProvider({
 		cacheDir: "/tmp/pi-agy-native-unit-test",
+		geminiDir: "/tmp/pi-agy-native-unit-test/gemini",
 		parkBatchMs: 0,
 		checkAvailable: () => true,
 		installGate: () => {},

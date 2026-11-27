@@ -106,6 +106,8 @@ export interface SessionSyncContext {
 
 export interface AgyNativeProviderOptions {
 	cacheDir: string;
+	/** Agy's config and conversation folder for the `agy acp` Pi starts, kept apart from `~/.gemini`. */
+	geminiDir: string;
 	binaryPath?: string;
 	parkBatchMs?: number;
 	hookDeadlineMs?: number;
@@ -685,7 +687,10 @@ export function createAgyNativeProvider(options: AgyNativeProviderOptions): AgyN
 
 	const ensureTransport = async (): Promise<AcpTransport> => {
 		if (transport) return transport;
-		(options.installGate ?? (() => installHook({ scriptPath: join(options.cacheDir, "pi-gate-hook.mjs") })))();
+		(options.installGate ?? (() => installHook({
+				hooksPath: join(options.geminiDir, "config", "hooks.json"),
+				scriptPath: join(options.cacheDir, "pi-gate-hook.mjs"),
+			})))();
 		const url = await gate.start();
 		const env = { [GATE_URL_ENV]: url };
 		const allowPermission = (toolCallId: string | undefined) => toolCallId !== undefined && approvedToolCalls.has(toolCallId);
@@ -693,6 +698,7 @@ export function createAgyNativeProvider(options: AgyNativeProviderOptions): AgyN
 			? options.createTransport(env, allowPermission)
 			: new AgyAcpClient({
 					binaryPath: options.binaryPath,
+					geminiDir: options.geminiDir,
 					env,
 					onPermissionRequest: (request) => allowPermission(request.toolCallId),
 					log: (msg) => log(`acp: ${msg}`),

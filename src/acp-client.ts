@@ -90,6 +90,8 @@ export class AcpRpcError extends Error {
 
 export interface AgyAcpClientOptions {
 	binaryPath?: string;
+	/** Passed as `--gemini-dir`: where Agy keeps its config and conversations instead of `~/.gemini`. */
+	geminiDir?: string;
 	/** Added to the environment `agy acp` and its hooks inherit. */
 	env?: Record<string, string>;
 	/** Decides Agy's `session/request_permission` requests; returns true to allow once. */
@@ -362,7 +364,8 @@ export class AgyAcpClient implements AcpTransport {
 				"Antigravity CLI ('agy') was not found on PATH. Install it or set PI_AGY_ACP_BIN to its path.",
 			);
 		}
-		const proc = spawn(binary, ["acp"], {
+		const args = this.options.geminiDir ? ["acp", "--gemini-dir", this.options.geminiDir] : ["acp"];
+		const proc = spawn(binary, args, {
 			env: { ...process.env, ...this.options.env },
 			detached: !IS_WINDOWS,
 			stdio: ["pipe", "pipe", "pipe"],
