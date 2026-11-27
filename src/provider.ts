@@ -38,7 +38,8 @@ import {
 	type AcpSessionUpdate,
 	type AcpUsage,
 } from "./acp-wire.ts";
-import { terminalAcpError } from "./errors.ts";
+import { defaultConversationStore, type ConversationStore } from "./conversation-store.ts";
+import { terminalAcpError, WarningLineFilter } from "./errors.ts";
 import { GATE_URL_ENV, GateServer, installHook, type GateRequest, type HookDecision, type HookToolCall } from "./hook-gate.ts";
 import { extractPostAssistantTail, renderTranscriptDelta, renderTranscriptReplay, userMessageToPromptBlocks } from "./prompt.ts";
 
@@ -119,6 +120,7 @@ export interface AgyNativeProviderOptions {
 	getSystemPromptAppend?: () => string | undefined;
 	/** Test seams. */
 	createTransport?: (env: Record<string, string>, onPermissionRequest: (toolCallId: string | undefined) => boolean) => AcpTransport;
+	conversationStore?: ConversationStore;
 	installGate?: () => void;
 	checkAvailable?: () => boolean;
 }
@@ -416,6 +418,7 @@ interface ActiveBridge {
 	aborted: boolean;
 	finishedTools: Map<string, ToolUpdate>;
 	toolWaiters: Map<string, Array<(update: ToolUpdate | undefined) => void>>;
+	warningFilter: WarningLineFilter;
 }
 
 interface BoundSession {
@@ -451,6 +454,36 @@ function pickThoughtLevel(
 	return undefined;
 }
 
+/**
+ * Resolves the `model` config value `agy acp` expects for a Pi model.
+ * Depending on account/CLI version, `agy` advertises either bare IDs with a
+ * separate `thought_level` select or effort-suffixed IDs such as
+ * `gemini-4-hydrogen-high`.
+ */
+export function resolveAgyModelValue(
+	model: Model<Api>,
+	reasoning: ModelThinkingLevel | undefined,
+	choices: readonly AcpChoice[],
+): { value: string; pinsEffort: boolean } | undefined {
+	if (choices.some((c) => c.value === model.id)) {
+		return { value: model.id, pinsEffort: false };
+	}
+	const mapped = reasoning ? model.thinkingLevelMap?.[reasoning] : undefined;
+	const candidates = [
+		typeof mapped === "string" ? mapped : undefined,
+		reasoning,
+		"medium",
+		"high",
+		"low",
+	].filter((level, index, all): level is string => typeof level === "string" && all.indexOf(level) === index);
+	for (const level of candidates) {
+		const suffixed = `${model.id}-${level}`;
+		const match = choices.find((c) => c.value.toLowerCase() === suffixed.toLowerCase());
+		if (match) return { value: match.value, pinsEffort: true };
+	}
+	return undefined;
+}
+
 async function applySessionModelAndThinking(
 	transport: AcpTransport,
 	sessionId: string,
@@ -464,15 +497,24 @@ async function applySessionModelAndThinking(
 	let config = transport.sessionConfig(sessionId);
 	let appliedModel = lastModelId;
 	let appliedThought = lastThoughtLevel;
+	let pinsEffort = false;
 
 	const modelSelect = config?.model;
-	if (modelSelect?.configId && (force || modelSelect.currentValue !== model.id || appliedModel !== model.id)) {
-		if (!modelSelect.choices.some((c) => c.value === model.id)) {
+	if (modelSelect?.configId) {
+		const resolved = resolveAgyModelValue(model, reasoning, modelSelect.choices);
+		if (!resolved) {
 			const offered = modelSelect.choices.map((c) => c.value).join(", ");
 			throw new Error(`agy acp does not offer model '${model.id}'. Available: ${offered || "none"}.`);
 		}
-		config = await transport.setConfigOption(sessionId, modelSelect.configId, model.id, signal);
-		appliedModel = model.id;
+		pinsEffort = resolved.pinsEffort;
+		if (force || modelSelect.currentValue !== resolved.value || appliedModel !== resolved.value) {
+			config = await transport.setConfigOption(sessionId, modelSelect.configId, resolved.value, signal);
+			appliedModel = resolved.value;
+		}
+	}
+
+	if (pinsEffort) {
+		return { modelId: appliedModel, thoughtLevel: undefined };
 	}
 
 	const thoughtSelect = config?.thoughtLevel;
@@ -620,6 +662,7 @@ export function createAgyNativeProvider(options: AgyNativeProviderOptions): AgyN
 	const log = options.log ?? (() => {});
 	const parkBatchMs = options.parkBatchMs ?? DEFAULT_PARK_BATCH_MS;
 	const hookDeadlineMs = options.hookDeadlineMs ?? DEFAULT_HOOK_DEADLINE_MS;
+	const conversationStore = options.conversationStore ?? defaultConversationStore;
 
 	let models: Model<typeof AGY_API>[] = [...BASELINE_MODELS];
 	let activePiSessionId: string | undefined;
@@ -764,6 +807,15 @@ export function createAgyNativeProvider(options: AgyNativeProviderOptions): AgyN
 		resolve?.({ kind: "aborted" });
 	};
 
+	const failBridgeRateLimit = (bridge: ActiveBridge, reason: string): void => {
+		const outcome: PhaseEnd = { kind: "error", error: new Error(reason) };
+		const resolve = bridge.phaseResolve;
+		bridge.phaseResolve = null;
+		if (!resolve) bridge.terminalOutcome = outcome;
+		clearBridge(bridge, true, reason);
+		resolve?.(outcome);
+	};
+
 	const routeUpdate = (bridge: ActiveBridge, update: AcpSessionUpdate): void => {
 		if (update.type === "usage_update") {
 			bridge.latestUsageUpdate = { used: update.used, size: update.size };
@@ -777,12 +829,15 @@ export function createAgyNativeProvider(options: AgyNativeProviderOptions): AgyN
 			for (const wake of waiters ?? []) wake(update);
 			return;
 		}
+		if (update.type !== "agent_message_chunk" && update.type !== "agent_thought_chunk") return;
 		if (!bridge.writer || bridge.writer.isSettled) {
 			bridge.bufferedUpdates.push(update);
 			return;
 		}
-		if (update.type === "agent_message_chunk") bridge.writer.append("text", update.text);
-		else if (update.type === "agent_thought_chunk") bridge.writer.append("thinking", update.text);
+		const writer = bridge.writer;
+		const kind = update.type === "agent_message_chunk" ? "text" : "thinking";
+		const quotaError = bridge.warningFilter.push(kind, update.text, (streamKind, text) => writer.append(streamKind, text));
+		if (quotaError) failBridgeRateLimit(bridge, quotaError);
 	};
 
 	const flushBufferedUpdates = (bridge: ActiveBridge): void => {
@@ -829,12 +884,12 @@ export function createAgyNativeProvider(options: AgyNativeProviderOptions): AgyN
 	};
 
 	const awaitBridgePhase = (bridge: ActiveBridge): Promise<PhaseEnd> => {
-		if (bridge.aborted) return Promise.resolve({ kind: "aborted" });
 		if (bridge.terminalOutcome) {
 			const outcome = bridge.terminalOutcome;
 			bridge.terminalOutcome = null;
 			return Promise.resolve(outcome);
 		}
+		if (bridge.aborted) return Promise.resolve({ kind: "aborted" });
 		if (bridge.pendingParks.some((park) => !park.answered)) {
 			return Promise.resolve({ kind: "parked", hooks: takePendingParks(bridge) });
 		}
@@ -891,6 +946,7 @@ export function createAgyNativeProvider(options: AgyNativeProviderOptions): AgyN
 		message.usage.totalTokens = piTranscriptTokens(context, message);
 
 		if (phase.kind === "parked") {
+			bridge.warningFilter.flush((kind, text) => writer.append(kind, text));
 			bridge.stepCount += 1;
 			for (const park of phase.hooks) {
 				const call = approvalToolCall(park.call, park.subagent, activeCwd);
@@ -912,12 +968,24 @@ export function createAgyNativeProvider(options: AgyNativeProviderOptions): AgyN
 		}
 
 		const { result } = phase;
+		const heldQuotaError = bridge.warningFilter.finish((kind, text) => writer.append(kind, text));
 		message.usage = normalizeTurnUsage(bridge.model, result.usage, bridge.latestUsageUpdate, bridge.stepCount);
 		message.usage.totalTokens = piTranscriptTokens(context, message);
+		if (heldQuotaError) {
+			writer.fail("error", heldQuotaError);
+			return;
+		}
 		const terminalError = terminalAcpError(message, result);
 		if (terminalError) {
 			writer.fail("error", terminalError);
 			return;
+		}
+		if (result.stopReason === "end_turn") {
+			try {
+				conversationStore.recordCheckpoint(options.geminiDir, bridge.sessionId, message.timestamp);
+			} catch (error) {
+				log(`checkpoint skipped sid=${bridge.sessionId}: ${errorMessage(error)}`);
+			}
 		}
 		finishFromStopReason(writer, result.stopReason);
 	};
@@ -1004,11 +1072,13 @@ export function createAgyNativeProvider(options: AgyNativeProviderOptions): AgyN
 			view.latestTimestamp(mark.acpSessionId) === mark.timestamp;
 		let session: BoundSession | null = null;
 		let needApplySettings = false;
+		let warm = false;
 
 		try {
 			if (continuable) {
 				if (boundSession?.acpSessionId === mark.acpSessionId) {
 					session = boundSession;
+					warm = true;
 				} else {
 					try {
 						await active.resumeSession({
@@ -1020,9 +1090,39 @@ export function createAgyNativeProvider(options: AgyNativeProviderOptions): AgyN
 						session = { acpSessionId: mark.acpSessionId, lastModelId: undefined, lastThoughtLevel: undefined };
 						// agy resets the model on session/resume.
 						needApplySettings = true;
+						warm = true;
 					} catch (error) {
 						if (signal?.aborted) throw error;
 						log(`session/resume failed sid=${mark.acpSessionId}: ${errorMessage(error)}`);
+					}
+				}
+			} else if (mark !== undefined) {
+				let forkId: string | undefined;
+				try {
+					forkId = conversationStore.forkConversation(options.geminiDir, mark.acpSessionId, mark.timestamp);
+				} catch (error) {
+					log(`native fork unavailable sid=${mark.acpSessionId}: ${errorMessage(error)}`);
+				}
+				if (forkId) {
+					if (boundSession) {
+						await active.closeSession(boundSession.acpSessionId);
+						boundSession = null;
+					}
+					try {
+						await active.resumeSession({
+							sessionId: forkId,
+							cwd: activeCwd,
+							systemPromptAppend: options.getSystemPromptAppend?.(),
+							signal,
+						});
+						log(`session/fork-resume source=${mark.acpSessionId} fork=${forkId}`);
+						session = { acpSessionId: forkId, lastModelId: undefined, lastThoughtLevel: undefined };
+						needApplySettings = true;
+						warm = true;
+					} catch (error) {
+						conversationStore.deleteConversation(options.geminiDir, forkId);
+						if (signal?.aborted) throw error;
+						log(`session/fork-resume failed fork=${forkId}: ${errorMessage(error)}`);
 					}
 				}
 			}
@@ -1054,8 +1154,7 @@ export function createAgyNativeProvider(options: AgyNativeProviderOptions): AgyN
 		}
 
 		const sessionId = session.acpSessionId;
-		const warm = continuable && session.acpSessionId === mark.acpSessionId;
-		const unseen = warm ? conversation.filter((entry) => entry.timestamp > mark.timestamp) : conversation;
+		const unseen = warm && mark ? conversation.filter((entry) => entry.timestamp > mark.timestamp) : conversation;
 		const toSend = forwardable(unseen, conversation);
 		const replayed = !warm && toSend.some((entry) => entry.role === "assistant");
 		const latest = toSend.at(-1);
@@ -1103,6 +1202,7 @@ export function createAgyNativeProvider(options: AgyNativeProviderOptions): AgyN
 			aborted: false,
 			finishedTools: new Map(),
 			toolWaiters: new Map(),
+			warningFilter: new WarningLineFilter(),
 		};
 		activeBridge = bridge;
 		active.setUpdateListener(sessionId, (update, raw) => {
@@ -1160,20 +1260,46 @@ export function createAgyNativeProvider(options: AgyNativeProviderOptions): AgyN
 				| undefined;
 			writer.ensureStarted();
 			let latestUsageUpdate: { used: number; size: number } | null = null;
-			active.setUpdateListener(sessionId, (update, raw) => {
-				void Promise.resolve(streamOptions?.onProviderStreamEvent?.(raw, model)).catch((err) =>
-					log(`onProviderStreamEvent failed: ${errorMessage(err)}`),
-				);
-				if (update.type === "usage_update") latestUsageUpdate = { used: update.used, size: update.size };
-				else if (update.type === "agent_message_chunk") writer.append("text", update.text);
-				else if (update.type === "agent_thought_chunk") writer.append("thinking", update.text);
-			});
-			const result = await active.prompt({ sessionId, prompt: rewritten?.prompt ?? promptBlocks, signal });
-			log(`side request raw ACP usage sid=${sessionId}: ${JSON.stringify(result.usage ?? null)}`);
-			message.usage = normalizeTurnUsage(model, result.usage, latestUsageUpdate, 1);
-			const terminalError = terminalAcpError(message, result);
-			if (terminalError) writer.fail("error", terminalError);
-			else finishFromStopReason(writer, result.stopReason);
+			const warningFilter = new WarningLineFilter();
+			const sideController = new AbortController();
+			const onSignalAbort = () => sideController.abort();
+			signal?.addEventListener("abort", onSignalAbort, { once: true });
+			if (signal?.aborted) sideController.abort();
+			let sideQuotaError: string | undefined;
+			try {
+				active.setUpdateListener(sessionId, (update, raw) => {
+					void Promise.resolve(streamOptions?.onProviderStreamEvent?.(raw, model)).catch((err) =>
+						log(`onProviderStreamEvent failed: ${errorMessage(err)}`),
+					);
+					if (update.type === "usage_update") {
+						latestUsageUpdate = { used: update.used, size: update.size };
+					} else if (update.type === "agent_message_chunk" || update.type === "agent_thought_chunk") {
+						const kind = update.type === "agent_message_chunk" ? "text" : "thinking";
+						const quotaError = warningFilter.push(kind, update.text, (streamKind, text) => writer.append(streamKind, text));
+						if (quotaError && !sideQuotaError) {
+							sideQuotaError = quotaError;
+							sideController.abort();
+						}
+					}
+				});
+				const result = await active.prompt({ sessionId, prompt: rewritten?.prompt ?? promptBlocks, signal: sideController.signal });
+				log(`side request raw ACP usage sid=${sessionId}: ${JSON.stringify(result.usage ?? null)}`);
+				if (sideQuotaError) {
+					writer.fail("error", sideQuotaError);
+					return;
+				}
+				const heldQuotaError = warningFilter.finish((kind, text) => writer.append(kind, text));
+				message.usage = normalizeTurnUsage(model, result.usage, latestUsageUpdate, 1);
+				if (heldQuotaError) {
+					writer.fail("error", heldQuotaError);
+					return;
+				}
+				const terminalError = terminalAcpError(message, result);
+				if (terminalError) writer.fail("error", terminalError);
+				else finishFromStopReason(writer, result.stopReason);
+			} finally {
+				signal?.removeEventListener("abort", onSignalAbort);
+			}
 		} catch (error) {
 			if (signal?.aborted) writer.fail("aborted", "Request was aborted");
 			else writer.fail("error", errorMessage(error));

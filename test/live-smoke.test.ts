@@ -125,3 +125,56 @@ test(
 		}
 	},
 );
+
+test(
+	"live agy acp: native SQLite copy-on-rewind fork preserves turn 1 and drops turn 2",
+	{ skip: !LIVE },
+	async () => {
+		const cacheDir = mkdtempSync(join(tmpdir(), "pi-agy-native-live-"));
+		const logs: string[] = [];
+		let view: { branchMark: { acpSessionId: string; timestamp: number }; latestTimestamp: () => number; retired: Set<string> } | undefined;
+		const handle = createAgyNativeProvider({
+			cacheDir,
+			geminiDir: join(cacheDir, "gemini"),
+			log: (message) => logs.push(message),
+			getSessionView: () => view,
+		});
+		try {
+			handle.syncSession({ piSessionId: "live-pi-1", cwd: process.cwd() });
+			const model = handle.provider.getModels().find((m) => m.id === MODEL)!;
+
+			// Turn 1: establish codeword ALPHA-9012.
+			const u1: Message = { role: "user", content: "Remember the codeword ALPHA-9012. Reply with only OK.", timestamp: Date.now() };
+			const a1 = await handle.provider.streamSimple(model, context([u1]), live(handle)).result();
+			assert.equal(a1.stopReason, "stop", a1.errorMessage);
+			const sid1 = a1.responseId?.replace(/^agy:/, "");
+			assert.ok(sid1);
+
+			// Turn 2: establish codeword BETA-4455 on the same session.
+			const u2: Message = { role: "user", content: "Also remember the codeword BETA-4455. Reply with only OK.", timestamp: a1.timestamp + 1 };
+			const a2 = await handle.provider.streamSimple(model, context([u1, a1, u2]), live(handle)).result();
+			assert.equal(a2.stopReason, "stop", a2.errorMessage);
+
+			// Rewind to after turn 1 (branchMark = a1, latestTimestamp = a2.timestamp).
+			view = {
+				branchMark: { acpSessionId: sid1, timestamp: a1.timestamp },
+				latestTimestamp: () => a2.timestamp,
+				retired: new Set(),
+			};
+			const u3: Message = {
+				role: "user",
+				content: "Which codewords do you remember from this conversation? List only the ones you know.",
+				timestamp: a2.timestamp + 1,
+			};
+			const a3 = await handle.provider.streamSimple(model, context([u1, a1, u3]), live(handle)).result();
+			assert.equal(a3.stopReason, "stop", a3.errorMessage);
+			const replyText = a3.content.map((part) => (part.type === "text" ? part.text : "")).join("");
+			assert.ok(logs.some((line) => line.startsWith("session/fork-resume ")), `expected native fork:\n${logs.join("\n")}`);
+			assert.match(replyText, /ALPHA-9012/);
+			assert.doesNotMatch(replyText, /BETA-4455/);
+		} finally {
+			await handle.dispose();
+			rmSync(cacheDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
+		}
+	},
+);

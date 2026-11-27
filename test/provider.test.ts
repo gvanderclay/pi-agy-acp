@@ -567,3 +567,135 @@ test("a message typed during tool execution is sent to Agy as a steering prompt"
 		await handle.dispose();
 	}
 });
+
+test("mid-stream quota retry notices cancel the turn and fail without leaking warning text", async () => {
+	const { transport, send, handle } = setup();
+	const cancelled = deferred<void>();
+	transport.promptImpl = async (req) => {
+		transport.text(req.sessionId, "⚠ API error (attempt 1): RESOURCE_EXHAUSTED (code 429): Quota reached\n");
+		req.signal?.addEventListener("abort", () => cancelled.resolve(), { once: true });
+		if (req.signal?.aborted) cancelled.resolve();
+		await cancelled.promise;
+		return { stopReason: "cancelled", usage: undefined };
+	};
+	try {
+		const reply = await send([user("hello", 1)]);
+		assert.equal(reply.stopReason, "error");
+		assert.match(reply.errorMessage ?? "", /Antigravity rate limited:.*RESOURCE_EXHAUSTED/);
+		assert.equal(textOf(reply), "");
+		assert.deepEqual(transport.cancelledSessions, ["acp-1"]);
+	} finally {
+		await handle.dispose();
+	}
+});
+
+test("final quota warning line fails the turn even without a code 429 suffix", async () => {
+	const { transport, send, handle } = setup();
+	transport.promptImpl = async (req) => {
+		transport.text(req.sessionId, "⚠ Individual quota reached. Resets in 2h.");
+		return { stopReason: "end_turn", usage: USAGE };
+	};
+	try {
+		const reply = await send([user("hello", 1)]);
+		assert.equal(reply.stopReason, "error");
+		assert.match(reply.errorMessage ?? "", /Individual quota reached/);
+		assert.equal(textOf(reply), "");
+	} finally {
+		await handle.dispose();
+	}
+});
+
+test("effort-suffixed model rosters select the matching variant and skip thought_level", async () => {
+	const setCalls: Array<{ configId: string; value: string }> = [];
+	const { transport, handle } = setup();
+	const suffixedConfig = (): AcpSessionConfig => ({
+		model: {
+			configId: "model",
+			currentValue: "gemini-4-hydrogen-medium",
+			choices: [
+				{ value: "gemini-4-hydrogen-low", name: "Hydrogen Low", description: undefined },
+				{ value: "gemini-4-hydrogen-medium", name: "Hydrogen Medium", description: undefined },
+				{ value: "gemini-4-hydrogen-high", name: "Hydrogen High", description: undefined },
+			],
+		},
+		thoughtLevel: {
+			configId: "thought_level",
+			currentValue: "medium",
+			choices: [
+				{ value: "low", name: "Low", description: undefined },
+				{ value: "medium", name: "Medium", description: undefined },
+				{ value: "high", name: "High", description: undefined },
+			],
+		},
+		availableModelVariants: [],
+	});
+	transport.createSession = async (options) => {
+		transport.createdSessions.push(options);
+		const cfg = suffixedConfig();
+		return { sessionId: "acp-1", config: cfg };
+	};
+	transport.sessionConfig = () => suffixedConfig();
+	transport.setConfigOption = async (_sessionId, configId, value) => {
+		setCalls.push({ configId, value });
+		const cfg = suffixedConfig();
+		if (configId === "model" && cfg.model) cfg.model.currentValue = value;
+		return cfg;
+	};
+	try {
+		const hydrogen = handle.provider.getModels().find((m) => m.id === "gemini-4-hydrogen")!;
+		const reply = await handle.provider
+			.streamSimple(hydrogen, makeContext([user("hi", 1)]), { ...live(handle), reasoning: "high" } as StreamOptions)
+			.result();
+		assert.equal(reply.stopReason, "stop", reply.errorMessage);
+		assert.deepEqual(setCalls, [{ configId: "model", value: "gemini-4-hydrogen-high" }]);
+	} finally {
+		await handle.dispose();
+	}
+});
+
+test("a rewind or fork resumes a native SQLite fork when available, and falls back to replay if resume fails", async () => {
+	let view: SessionView | undefined;
+	const recorded: Array<{ sessionId: string; timestamp: number }> = [];
+	const deleted: string[] = [];
+	let nextForkId: string | undefined = "fork-acp-1";
+	const { transport, send, handle, notices } = setup({
+		getSessionView: () => view,
+		conversationStore: {
+			recordCheckpoint: (_dir, sessionId, timestamp) => {
+				recorded.push({ sessionId, timestamp });
+				return { steps: 1, generations: 1, executions: 1 };
+			},
+			forkConversation: () => nextForkId,
+			deleteConversation: (_dir, id) => {
+				deleted.push(id);
+			},
+		},
+	});
+	try {
+		const first = user("hello", 1);
+		const reply = await send([first]);
+		assert.deepEqual(recorded, [{ sessionId: "acp-1", timestamp: reply.timestamp }]);
+
+		// Rewind: native fork succeeds -> session/resume on fork-acp-1, only new message sent, no replay notice.
+		const mark = { acpSessionId: "acp-1", timestamp: reply.timestamp };
+		view = { branchMark: mark, latestTimestamp: () => reply.timestamp + 100, retired: new Set() };
+		await send([first, reply, user("branched question", reply.timestamp + 1)]);
+		assert.equal(transport.createdSessions.length, 1);
+		assert.deepEqual(transport.resumedSessions.map((s) => s.sessionId), ["fork-acp-1"]);
+		assert.equal(promptText(transport.prompts[1]), "branched question");
+		assert.equal(notices.length, 0);
+
+		// If resumeSession rejects the fork, delete the orphaned fork and fall back cleanly to session/new + replay.
+		nextForkId = "fork-acp-bad";
+		transport.resumeSession = async () => {
+			throw new Error("corrupt fork");
+		};
+		await send([first, reply, user("fallback question", reply.timestamp + 2)]);
+		assert.deepEqual(deleted, ["fork-acp-bad"]);
+		assert.equal(transport.createdSessions.length, 2);
+		assert.match(promptText(transport.prompts[2]), /<conversation_history>[\s\S]*hello[\s\S]*<\/conversation_history>\nfallback question$/);
+		assert.equal(notices.length, 1);
+	} finally {
+		await handle.dispose();
+	}
+});
