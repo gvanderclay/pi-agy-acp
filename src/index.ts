@@ -17,8 +17,11 @@ import { Type } from "typebox";
 import {
 	AGY_COMMAND_TOOL,
 	AGY_EDIT_TOOL,
+	AGY_MESSAGE_TOOL,
 	AGY_OTHER_TOOL,
 	AGY_PROVIDER_ID,
+	AGY_SEARCH_TOOL,
+	AGY_SUBAGENT_TOOL,
 	AGY_TOOL_NAMES,
 	agyTurnMark,
 	agyRoleInstructions,
@@ -119,6 +122,31 @@ export default function agyNativeExtension(pi: ExtensionAPI): void {
 		label: "Agy edit",
 		description: "A file Antigravity wants to edit. Only the agy-native provider calls this tool.",
 		parameters: Type.Object({ path: Type.String({ description: "File path" }), subagent }),
+		defaultActive: false,
+		execute: (toolCallId, _params, signal) => run(toolCallId, signal),
+	});
+	pi.registerTool({
+		name: AGY_SEARCH_TOOL,
+		label: "Agy web search",
+		description: "A web search Antigravity wants to run. Only the agy-native provider calls this tool.",
+		parameters: Type.Object({ query: Type.String({ description: "Search query" }), subagent }),
+		defaultActive: false,
+		execute: (toolCallId, _params, signal) => run(toolCallId, signal),
+	});
+	const agyArguments = Type.Record(Type.String(), Type.Unknown(), { description: "Antigravity tool arguments" });
+	pi.registerTool({
+		name: AGY_SUBAGENT_TOOL,
+		label: "Agy subagent",
+		description: "An Antigravity subagent Antigravity wants to start. Only the agy-native provider calls this tool.",
+		parameters: Type.Object({ arguments: agyArguments, subagent }),
+		defaultActive: false,
+		execute: (toolCallId, _params, signal) => run(toolCallId, signal),
+	});
+	pi.registerTool({
+		name: AGY_MESSAGE_TOOL,
+		label: "Agy message",
+		description: "A message between Antigravity's agent and its subagents. Only the agy-native provider calls this tool.",
+		parameters: Type.Object({ arguments: agyArguments, subagent }),
 		defaultActive: false,
 		execute: (toolCallId, _params, signal) => run(toolCallId, signal),
 	});

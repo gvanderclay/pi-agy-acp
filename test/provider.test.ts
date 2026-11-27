@@ -17,9 +17,10 @@ import type {
 	AcpUpdateListener,
 } from "../src/acp-client.ts";
 import type { AcpAgentInfo, AcpPromptResult, AcpSessionConfig, AcpSessionUpdate } from "../src/acp-wire.ts";
-import { GATE_URL_ENV } from "../src/hook-gate.ts";
+import { GATE_URL_ENV, type HookToolCall } from "../src/hook-gate.ts";
 import {
 	agyRoleInstructions,
+	approvalToolCall,
 	createAgyNativeProvider,
 	modelsFromSessionConfig,
 	normalizeTurnUsage,
@@ -378,14 +379,22 @@ test("subagent and unknown tool calls are shown as such and return without outpu
 		const parked = await send([user("research", 1)]);
 		const call = parked.content.find((part) => part.type === "toolCall");
 		assert.ok(call && call.type === "toolCall");
-		assert.equal(call.name, "agy_tool");
-		assert.deepEqual(call.arguments, { tool: "search_web", arguments: { query: "pi" }, subagent: true });
+		assert.equal(call.name, "agy_search_web");
+		assert.deepEqual(call.arguments, { query: "pi", subagent: true });
 		const output = await handle.runApprovedTool(call.id, undefined);
 		assert.equal(output.isError, false);
 		assert.match(output.text, /subagent/);
 	} finally {
 		await handle.dispose();
 	}
+});
+
+test("each known Agy tool gets its own approval tool, so Pi rules can tell them apart", () => {
+	const call = (name: string, args: Record<string, unknown>) => approvalToolCall({ toolCallId: "tc", toolName: name, args } as HookToolCall, false, "/work");
+	assert.deepEqual(call("search_web", { query: "pi" }), { name: "agy_search_web", arguments: { query: "pi" } });
+	assert.deepEqual(call("invoke_subagent", { Prompt: "go", Role: "r" }), { name: "agy_invoke_subagent", arguments: { arguments: { Prompt: "go", Role: "r" } } });
+	assert.deepEqual(call("send_message", { Message: "hi" }), { name: "agy_send_message", arguments: { arguments: { Message: "hi" } } });
+	assert.deepEqual(call("new_tool", { X: 1 }), { name: "agy_tool", arguments: { tool: "new_tool", arguments: { X: 1 } } });
 });
 
 test("a hook call with no Pi turn running is denied", async () => {

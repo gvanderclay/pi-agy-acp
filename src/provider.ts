@@ -46,8 +46,18 @@ export const AGY_PROVIDER_ID = "agy-native";
 export const AGY_API = "agy-native";
 export const AGY_COMMAND_TOOL = "agy_command";
 export const AGY_EDIT_TOOL = "agy_edit";
+export const AGY_SEARCH_TOOL = "agy_search_web";
+export const AGY_SUBAGENT_TOOL = "agy_invoke_subagent";
+export const AGY_MESSAGE_TOOL = "agy_send_message";
 export const AGY_OTHER_TOOL = "agy_tool";
-export const AGY_TOOL_NAMES = [AGY_COMMAND_TOOL, AGY_EDIT_TOOL, AGY_OTHER_TOOL] as const;
+export const AGY_TOOL_NAMES = [
+	AGY_COMMAND_TOOL,
+	AGY_EDIT_TOOL,
+	AGY_SEARCH_TOOL,
+	AGY_SUBAGENT_TOOL,
+	AGY_MESSAGE_TOOL,
+	AGY_OTHER_TOOL,
+] as const;
 /** `responseId` prefix naming the Agy session that produced a reply. */
 const SESSION_RESPONSE_PREFIX = "agy:";
 
@@ -531,6 +541,15 @@ export function approvalToolCall(
 		case "write_file":
 			if (path) return { name: AGY_EDIT_TOOL, arguments: { path, ...marker } };
 			break;
+		case "search_web": {
+			const query = stringArg(call.args, "query", "Query");
+			if (query) return { name: AGY_SEARCH_TOOL, arguments: { query, ...marker } };
+			break;
+		}
+		case "invoke_subagent":
+			return { name: AGY_SUBAGENT_TOOL, arguments: { arguments: call.args, ...marker } };
+		case "send_message":
+			return { name: AGY_MESSAGE_TOOL, arguments: { arguments: call.args, ...marker } };
 	}
 	// A top-level path lets Pi's path rules see the file the call touches.
 	return { name: AGY_OTHER_TOOL, arguments: { tool: call.toolName, arguments: call.args, ...(path ? { path } : {}), ...marker } };

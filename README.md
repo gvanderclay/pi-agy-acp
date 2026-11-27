@@ -25,7 +25,14 @@ tool calls may run.
      tool: `"shellTools": { "agy_command": { "commandArgument": "command", "workdirArgument": "cwd" } }`);
    - `read_file` → Pi's own `read { path }`, checked against read rules;
    - `edit_file`, `write_file` → `agy_edit { path }`;
+   - `search_web` → `agy_search_web { query }`;
+   - `invoke_subagent` → `agy_invoke_subagent { arguments }`, and
+     `send_message` → `agy_send_message { arguments }`;
    - anything else → `agy_tool { tool, arguments, path? }`.
+
+   Pi rules match an extension tool by name and `path` only, so each known
+   Agy tool has its own name; a rule on `agy_tool` covers the tools Agy adds
+   later.
 
    If Pi blocks the call, Agy is told Pi's reason. If Pi allows it, Agy runs
    it and its output becomes the Pi tool result. Subagent calls are gated the
