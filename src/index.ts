@@ -6,7 +6,13 @@
 import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { Message } from "@earendil-works/pi-ai";
-import { getAgentDir, type ExtensionAPI, type ExtensionContext, type SessionEntry } from "@earendil-works/pi-coding-agent";
+import {
+	getAgentDir,
+	type BuildSystemPromptOptions,
+	type ExtensionAPI,
+	type ExtensionContext,
+	type SessionEntry,
+} from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import {
 	AGY_COMMAND_TOOL,
@@ -15,6 +21,7 @@ import {
 	AGY_PROVIDER_ID,
 	AGY_TOOL_NAMES,
 	agyTurnMark,
+	agyRoleInstructions,
 	createAgyNativeProvider,
 	type AgyTurnMark,
 	type SessionView,
@@ -65,11 +72,14 @@ export default function agyNativeExtension(pi: ExtensionAPI): void {
 	log?.(`Loaded provider from ${import.meta.url}`);
 
 	let session: ExtensionContext | undefined;
+	// The run's prompt options; handlers that run after this one still edit the same object.
+	let promptOptions: BuildSystemPromptOptions | undefined;
 
 	const handle = createAgyNativeProvider({
 		cacheDir,
 		log,
 		notify: (message) => session?.ui.notify(message, "warning"),
+		getSystemPromptAppend: () => (promptOptions ? agyRoleInstructions(promptOptions) : undefined),
 		getSessionView: (): SessionView | undefined => {
 			const manager = session?.sessionManager;
 			if (!manager) return undefined;
@@ -172,6 +182,10 @@ export default function agyNativeExtension(pi: ExtensionAPI): void {
 				tokensBefore: event.preparation.tokensBefore,
 			},
 		};
+	});
+
+	pi.on("before_agent_start", (event) => {
+		promptOptions = event.systemPromptOptions;
 	});
 
 	pi.on("context_with_system", (_event, ctx) => {

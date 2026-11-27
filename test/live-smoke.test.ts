@@ -45,6 +45,29 @@ test(
 );
 
 test(
+	"live agy acp: the session's role instructions reach Agy",
+	{ skip: !LIVE },
+	async () => {
+		const cacheDir = mkdtempSync(join(tmpdir(), "pi-agy-native-live-"));
+		const handle = createAgyNativeProvider({
+			cacheDir,
+			getSystemPromptAppend: () => "When asked for your role code, reply with only the word HERON-5528.",
+		});
+		try {
+			handle.syncSession({ piSessionId: "live-pi-1", cwd: process.cwd() });
+			const model = handle.provider.getModels().find((m) => m.id === "gemini-4-neon")!;
+			const ask: Message = { role: "user", content: "What is your role code?", timestamp: Date.now() };
+			const reply = await handle.provider.streamSimple(model, context([ask]), live(handle)).result();
+			assert.equal(reply.stopReason, "stop", reply.errorMessage);
+			assert.match(reply.content.map((part) => (part.type === "text" ? part.text : "")).join(""), /HERON-5528/);
+		} finally {
+			await handle.dispose();
+			rmSync(cacheDir, { recursive: true, force: true });
+		}
+	},
+);
+
+test(
 	"live agy acp: a side request follows its instructions",
 	{ skip: !LIVE },
 	async () => {

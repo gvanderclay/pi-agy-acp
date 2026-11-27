@@ -8,8 +8,12 @@ tool calls may run.
 ## How it works
 
 1. **Stock Agy.** The provider starts `agy acp` with your own Antigravity
-   configuration and an honest `clientInfo`. It sends no system prompt and no
-   tools.
+   configuration and an honest `clientInfo`. It sends no tools. Of Pi's
+   system prompt it sends only the role instructions, appended to Agy's own
+   prompt through `_meta.antigravity.systemPrompt.append` on every
+   `session/new` and `session/resume`: the `--append-system-prompt` text
+   and Squire's `squire_delegate_task` section. A normal Pi session has
+   neither, so Agy runs with its stock prompt.
 2. **Every Agy tool call goes through Pi.** On first use the provider adds a
    `pi-gate` `PreToolUse` entry to `~/.gemini/config/hooks.json` (other entries
    are kept) that runs `~/.pi/agent/cache/agy-native/pi-gate-hook.mjs`. The

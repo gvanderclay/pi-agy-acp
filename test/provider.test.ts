@@ -19,6 +19,7 @@ import type {
 import type { AcpAgentInfo, AcpPromptResult, AcpSessionConfig, AcpSessionUpdate } from "../src/acp-wire.ts";
 import { GATE_URL_ENV } from "../src/hook-gate.ts";
 import {
+	agyRoleInstructions,
 	createAgyNativeProvider,
 	modelsFromSessionConfig,
 	normalizeTurnUsage,
@@ -466,6 +467,33 @@ test("a branch that dropped Agy's last reply starts a fresh Agy session with the
 	} finally {
 		await handle.dispose();
 	}
+});
+
+test("the Pi session's role instructions are appended to Agy's prompt when its session starts or resumes", async () => {
+	const fresh = setup({ getSystemPromptAppend: () => "ROLE" });
+	const resumed = setup({
+		getSystemPromptAppend: () => "ROLE",
+		getSessionView: () => ({ branchMark: { acpSessionId: "old-acp", timestamp: 10 }, latestTimestamp: () => 10, retired: new Set() }),
+	});
+	try {
+		await fresh.send([user("hello", 1)]);
+		assert.deepEqual(fresh.transport.createdSessions.map((s) => s.systemPromptAppend), ["ROLE"]);
+		const earlier: AssistantMessage = { role: "assistant", content: [{ type: "text", text: "old" }], api: "agy-native", provider: "agy-native", model: "gemini-4-neon", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: 10 };
+		await resumed.send([user("hello", 1), earlier, user("still there?", 11)]);
+		assert.deepEqual(resumed.transport.resumedSessions.map((s) => s.systemPromptAppend), ["ROLE"]);
+	} finally {
+		await fresh.handle.dispose();
+		await resumed.handle.dispose();
+	}
+});
+
+test("Agy gets the appended system prompt and Squire's delegate section, not the rest of Pi's prompt", () => {
+	const role = agyRoleInstructions({
+		appendSystemPrompt: "Find the evidence the parent needs.",
+		sections: { squire_delegate_task: "You are a delegate.", posthorse: "Pi rolls context over automatically." },
+	});
+	assert.equal(role, "You are a delegate.\n\nFind the evidence the parent needs.");
+	assert.equal(agyRoleInstructions({ appendSystemPrompt: "", sections: { posthorse: "x" } }), undefined);
 });
 
 test("an Agy session from an earlier Pi process is resumed, not replayed", async () => {

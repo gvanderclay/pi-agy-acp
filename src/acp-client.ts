@@ -39,7 +39,14 @@ const IS_WINDOWS = process.platform === "win32";
 
 export interface AcpSessionStartOptions {
 	cwd: string;
+	/** A session/resume that leaves it out clears the earlier append, so pass it on every call. */
+	systemPromptAppend?: string;
 	signal?: AbortSignal;
+}
+
+function systemPromptMeta(options: AcpSessionStartOptions): { _meta?: unknown } {
+	const append = options.systemPromptAppend?.trim();
+	return append ? { _meta: { antigravity: { systemPrompt: { append } } } } : {};
 }
 
 export interface AcpSessionResumeOptions extends AcpSessionStartOptions {
@@ -226,7 +233,7 @@ export class AgyAcpClient implements AcpTransport {
 		await this.ensureReady(options.signal);
 		const conn = this.requireConnection();
 		const raw = await abortable(
-			this.request("session/new", { cwd: options.cwd, mcpServers: [] }, this.handshakeTimeoutMs),
+			this.request("session/new", { cwd: options.cwd, mcpServers: [], ...systemPromptMeta(options) }, this.handshakeTimeoutMs),
 			options.signal,
 		);
 		const parsed = parseNewSessionResult(raw);
@@ -240,7 +247,7 @@ export class AgyAcpClient implements AcpTransport {
 		const raw = await abortable(
 			this.request(
 				"session/resume",
-				{ sessionId: options.sessionId, cwd: options.cwd, mcpServers: [] },
+				{ sessionId: options.sessionId, cwd: options.cwd, mcpServers: [], ...systemPromptMeta(options) },
 				this.handshakeTimeoutMs,
 			),
 			options.signal,

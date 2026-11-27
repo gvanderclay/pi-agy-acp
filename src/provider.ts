@@ -103,10 +103,26 @@ export interface AgyNativeProviderOptions {
 	/** Shown to the user when Agy starts a new session with the kept conversation. */
 	notify?: (message: string) => void;
 	getSessionView?: () => SessionView | undefined;
+	/** Text appended to Agy's own system prompt for the conversation's session. */
+	getSystemPromptAppend?: () => string | undefined;
 	/** Test seams. */
 	createTransport?: (env: Record<string, string>, onPermissionRequest: (toolCallId: string | undefined) => boolean) => AcpTransport;
 	installGate?: () => void;
 	checkAvailable?: () => boolean;
+}
+
+/**
+ * The parts of Pi's system prompt that tell this session its role: the
+ * `--append-system-prompt` text (a Squire delegate's role instructions) and
+ * the section pi-squire writes for a delegate (src/index.ts,
+ * `squire_delegate_task`). The rest describes Pi's tools and harness, which Agy
+ * does not have.
+ */
+export function agyRoleInstructions(options: { appendSystemPrompt?: string; sections?: Record<string, string> }): string | undefined {
+	const parts = [options.sections?.squire_delegate_task, options.appendSystemPrompt]
+		.map((part) => part?.trim())
+		.filter((part): part is string => !!part);
+	return parts.length > 0 ? parts.join("\n\n") : undefined;
 }
 
 export interface ApprovedToolResult {
@@ -970,7 +986,12 @@ export function createAgyNativeProvider(options: AgyNativeProviderOptions): AgyN
 					session = boundSession;
 				} else {
 					try {
-						await active.resumeSession({ sessionId: mark.acpSessionId, cwd: activeCwd, signal });
+						await active.resumeSession({
+							sessionId: mark.acpSessionId,
+							cwd: activeCwd,
+							systemPromptAppend: options.getSystemPromptAppend?.(),
+							signal,
+						});
 						session = { acpSessionId: mark.acpSessionId, lastModelId: undefined, lastThoughtLevel: undefined };
 						// agy resets the model on session/resume.
 						needApplySettings = true;
@@ -983,7 +1004,7 @@ export function createAgyNativeProvider(options: AgyNativeProviderOptions): AgyN
 			if (!session) {
 				if (boundSession) await active.closeSession(boundSession.acpSessionId);
 				boundSession = null;
-				const created = await active.createSession({ cwd: activeCwd, signal });
+				const created = await active.createSession({ cwd: activeCwd, systemPromptAppend: options.getSystemPromptAppend?.(), signal });
 				log(`session/new sid=${created.sessionId}`);
 				session = { acpSessionId: created.sessionId, lastModelId: undefined, lastThoughtLevel: undefined };
 				needApplySettings = true;
