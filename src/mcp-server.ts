@@ -11,7 +11,7 @@ import type { ImageContent, TextContent } from "@earendil-works/pi-ai";
 import { isRecord } from "./acp-wire.ts";
 import { fingerprintProjectedTools, type ProjectedTool } from "./tools.ts";
 
-export const MCP_SERVER_NAME = "pi-tools";
+export const MCP_SERVER_NAME = "host";
 export const MCP_TOKEN_HEADER = "x-pi-agy-token";
 const MCP_PATH = "/mcp";
 const MAX_BODY_BYTES = 4 * 1024 * 1024;

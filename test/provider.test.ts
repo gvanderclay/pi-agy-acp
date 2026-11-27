@@ -731,7 +731,7 @@ test("configured Pi tools are projected over MCP, auto-approved in PreToolUse, a
 		assert.deepEqual(listJson.result.tools.map((t) => t.name), ["delegate"]);
 
 		// Agy's PreToolUse hook fires first and should auto-approve our own MCP tool without double-gating.
-		hookDecision = await transport.hook({ id: "tc-mcp-1", name: "mcp_pi-tools_delegate", args: { task: "fix bug" } }, req.sessionId);
+		hookDecision = await transport.hook({ id: "tc-mcp-1", name: "mcp_host_delegate", args: { task: "fix bug" } }, req.sessionId);
 
 		// Then Agy invokes the MCP server, which parks until Pi executes the real `delegate` tool.
 		const callRes = await fetch(mcp.url, {
