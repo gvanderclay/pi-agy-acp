@@ -37,7 +37,7 @@
 	"scripts": {
 		"typecheck": "tsc -p .",
 		"test": "node --test --test-timeout=30000 test/*.test.ts",
-		"test:live": "PI_AGY_ACP_LIVE=1 node --test --test-timeout=120000 test/live-smoke.test.ts",
+		"test:live": "PI_AGY_ACP_LIVE=1 node --test --test-timeout=120000 test/live-smoke.test.ts test/live-pi.test.ts",
 		"check": "pnpm typecheck && pnpm test"
 	},
 	"publishConfig": {

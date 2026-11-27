@@ -7,6 +7,7 @@ import { createInitialSystemMessage, type Message, type TranscriptContext } from
 import { createAgyNativeProvider, type AgyNativeProviderHandle } from "../src/provider.ts";
 
 const LIVE = process.env.PI_AGY_ACP_LIVE === "1";
+const MODEL = "gemini-3.8-flash";
 
 function live(handle: AgyNativeProviderHandle) {
 	const signal = new AbortController().signal;
@@ -25,7 +26,7 @@ test(
 		const handle = createAgyNativeProvider({ cacheDir, geminiDir: join(cacheDir, "gemini") });
 		try {
 			handle.syncSession({ piSessionId: "live-pi-1", cwd: process.cwd() });
-			const model = handle.provider.getModels().find((m) => m.id === "gemini-4-neon")!;
+			const model = handle.provider.getModels().find((m) => m.id === MODEL)!;
 			const first: Message = { role: "user", content: "Run the shell command: echo live-smoke-7731 . Then reply with the word done.", timestamp: Date.now() };
 			const parked = await handle.provider.streamSimple(model, context([first]), live(handle)).result();
 			assert.equal(parked.stopReason, "toolUse", parked.errorMessage);
@@ -57,7 +58,7 @@ test(
 		});
 		try {
 			handle.syncSession({ piSessionId: "live-pi-1", cwd: process.cwd() });
-			const model = handle.provider.getModels().find((m) => m.id === "gemini-4-neon")!;
+			const model = handle.provider.getModels().find((m) => m.id === MODEL)!;
 			const ask: Message = { role: "user", content: "What is your role code?", timestamp: Date.now() };
 			const reply = await handle.provider.streamSimple(model, context([ask]), live(handle)).result();
 			assert.equal(reply.stopReason, "stop", reply.errorMessage);
@@ -78,7 +79,7 @@ test(
 		const handle = createAgyNativeProvider({ cacheDir, geminiDir: join(cacheDir, "gemini") });
 		try {
 			handle.syncSession({ piSessionId: "live-pi-1", cwd: process.cwd() });
-			const model = handle.provider.getModels().find((m) => m.id === "gemini-4-neon")!;
+			const model = handle.provider.getModels().find((m) => m.id === MODEL)!;
 			const side = {
 				messages: [
 					createInitialSystemMessage("Reply with only the word that follows 'code:' in the user's message, in upper case.", [])!,
@@ -106,7 +107,7 @@ test(
 		const handle = createAgyNativeProvider({ cacheDir, geminiDir: join(cacheDir, "gemini"), log: (message) => logs.push(message) });
 		try {
 			handle.syncSession({ piSessionId: "live-pi-1", cwd: process.cwd() });
-			const model = handle.provider.getModels().find((m) => m.id === "gemini-4-neon")!;
+			const model = handle.provider.getModels().find((m) => m.id === MODEL)!;
 			const side = {
 				messages: [
 					createInitialSystemMessage("Use your shell tool exactly once, then reply with one sentence saying whether it ran.", [])!,
