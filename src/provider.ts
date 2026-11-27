@@ -1,30 +1,35 @@
 /**
- * Native Pi 1.6+ `Provider` (`agy-acp`) backed by Antigravity CLI ACP (`agy acp`)
- * with full Pi tool execution over an ephemeral in-memory Streamable HTTP MCP bridge.
+ * Pi `Provider` (`agy-native`) that runs the stock Antigravity agent (`agy acp`).
+ *
+ * Agy keeps its own prompt, tools and history. Each Agy tool call reaches Pi
+ * through the `pi-gate` hook (see `hook-gate.ts`) and is shown to Pi as an
+ * approval tool call, so Pi's permission system decides whether it runs.
  */
 
 import {
 	calculateCost,
 	createAssistantMessageEventStream,
-	getCurrentTools,
 	type Api,
 	type AssistantMessage,
 	type AssistantMessageEventStream,
-	type ImageContent,
 	type JsonObject,
+	type Message,
 	type Model,
 	type ModelThinkingLevel,
 	type Provider,
 	type RefreshModelsContext,
 	type SimpleStreamOptions,
 	type StreamOptions,
-	type TextContent,
 	type ThinkingLevelMap,
+	type ToolResultMessage,
 	type TranscriptContext,
 	type Usage,
 } from "@earendil-works/pi-ai";
+import { estimateTokens } from "@earendil-works/pi-coding-agent";
+import { join } from "node:path";
 import { AgyAcpClient, resolveAgyBinary, type AcpTransport } from "./acp-client.ts";
 import {
+	isRecord,
 	type AcpChoice,
 	type AcpPromptBlock,
 	type AcpPromptResult,
@@ -32,72 +37,93 @@ import {
 	type AcpSessionUpdate,
 	type AcpUsage,
 } from "./acp-wire.ts";
-import { McpBridgeServer, type ParkedToolCall } from "./mcp-server.ts";
 import { terminalAcpError } from "./errors.ts";
-import {
-	extractPostAssistantTail,
-	fingerprintMessages,
-	hashSystemPromptAppend,
-	messagesAfterFingerprint,
-	renderSystemPromptAppend,
-	renderTranscriptDelta,
-	renderTranscriptReplay,
-	type HostPromptSources,
-} from "./prompt.ts";
-import { projectPiTools } from "./tools.ts";
+import { GATE_URL_ENV, GateServer, installHook, type GateRequest, type HookDecision, type HookToolCall } from "./hook-gate.ts";
+import { extractPostAssistantTail, renderTranscriptDelta, renderTranscriptReplay, userMessageToPromptBlocks } from "./prompt.ts";
 
-export const AGY_ACP_PROVIDER_ID = "agy-acp";
-export const AGY_ACP_API = "agy-acp";
-/** Agent definition and prompt ownership changed; old ACP sessions must not resume. */
-export const ACP_CONFIGURATION_VERSION = 2;
+export const AGY_PROVIDER_ID = "agy-native";
+export const AGY_API = "agy-native";
+export const AGY_COMMAND_TOOL = "agy_command";
+export const AGY_EDIT_TOOL = "agy_edit";
+export const AGY_OTHER_TOOL = "agy_tool";
+export const AGY_TOOL_NAMES = [AGY_COMMAND_TOOL, AGY_EDIT_TOOL, AGY_OTHER_TOOL] as const;
+export const TYPED_ONLY_REPLY = "Agy only answers messages you type.";
+/** `responseId` of a reply Pi wrote without contacting Agy. */
+export const DECLINED_RESPONSE_ID = "agy-native:declined";
+/** `responseId` prefix naming the Agy session that produced a reply. */
+const SESSION_RESPONSE_PREFIX = "agy:";
 
 const EFFORT_LEVELS = ["low", "medium", "high", "xhigh", "max"] as const;
 const DEFAULT_PARK_BATCH_MS = 10;
-const DEFAULT_AUX_IDLE_MS = 60_000;
+/** Below the hook's one-hour timeout, so Agy gets Pi's reason instead of a hook timeout. */
+const DEFAULT_HOOK_DEADLINE_MS = 55 * 60_000;
 
-export interface PersistedAcpBinding {
-	configurationVersion?: number;
-	piSessionId: string;
+/** An Agy reply on the Pi branch: which Agy session wrote it, and when. */
+export interface AgyTurnMark {
 	acpSessionId: string;
-	syncedFingerprint: string;
-	systemPromptHash: string;
-	cwd: string;
-	modelId: string;
+	timestamp: number;
+}
+
+export function agyTurnMark(message: Message): AgyTurnMark | undefined {
+	if (message.role !== "assistant" || message.provider !== AGY_PROVIDER_ID) return undefined;
+	const id = message.responseId;
+	if (!id?.startsWith(SESSION_RESPONSE_PREFIX)) return undefined;
+	return { acpSessionId: id.slice(SESSION_RESPONSE_PREFIX.length), timestamp: message.timestamp };
+}
+
+/** What the Pi session file says about Agy sessions, beyond the messages in the request. */
+export interface SessionView {
+	/** The newest Agy reply on the current branch, even if compaction dropped it from the request. */
+	branchMark: AgyTurnMark | undefined;
+	/** The newest Agy reply anywhere in the session file for this Agy session. */
+	latestTimestamp(acpSessionId: string): number | undefined;
+	/** Agy sessions this Pi session must not continue (they belong to the session it was forked from). */
+	retired: ReadonlySet<string>;
+}
+
+function viewFromMessages(messages: readonly Message[]): SessionView {
+	const marks = messages.flatMap((message) => agyTurnMark(message) ?? []);
+	return {
+		branchMark: marks.at(-1),
+		latestTimestamp: (acpSessionId) =>
+			marks.filter((mark) => mark.acpSessionId === acpSessionId).at(-1)?.timestamp,
+		retired: new Set(),
+	};
 }
 
 export interface SessionSyncContext {
 	piSessionId: string;
 	cwd: string;
-	persistedBinding?: PersistedAcpBinding;
-	isFork?: boolean;
 }
 
-export interface AgyAcpProviderOptions {
-	getPromptSources?: () => HostPromptSources | undefined;
+export interface AgyNativeProviderOptions {
 	cacheDir: string;
 	binaryPath?: string;
 	parkBatchMs?: number;
-	/** Idle timeout before disposing the auxiliary `agy acp` process (default 60s). */
-	auxIdleMs?: number;
+	hookDeadlineMs?: number;
 	log?: (message: string) => void;
-	onBindingChange?: (binding: PersistedAcpBinding) => void;
-	/** Test seams: inject custom MCP server / ACP transports instead of spawning real processes. */
-	createMcpServer?: () => McpBridgeServer;
-	createMainTransport?: (mcpEndpoint: { url: string; token: string }) => AcpTransport;
-	createAuxTransport?: () => AcpTransport;
+	/** Shown to the user when Agy starts a new session with the kept conversation. */
+	notify?: (message: string) => void;
+	getSessionView?: () => SessionView | undefined;
+	/** Test seams. */
+	createTransport?: (env: Record<string, string>, onPermissionRequest: (toolCallId: string | undefined) => boolean) => AcpTransport;
+	installGate?: () => void;
 	checkAvailable?: () => boolean;
 }
 
-export interface AgyAcpProviderHandle {
-	provider: Provider<typeof AGY_ACP_API>;
-	/** Updates active Pi session context (called on `session_start` and `session_tree`). */
+export interface ApprovedToolResult {
+	text: string;
+	isError: boolean;
+}
+
+export interface AgyNativeProviderHandle {
+	provider: Provider<typeof AGY_API>;
+	gate: GateServer;
 	syncSession(ctx: SessionSyncContext): void;
 	expectLiveRequest(signal: AbortSignal | undefined): void;
-	/** Invalidates live ACP session continuity (called on `session_compact`). */
-	invalidateSession(reason?: string): void;
-	/** Cancels any parked MCP tool calls if Pi exits the agent loop without resuming. */
+	/** Lets the Agy tool call behind a Pi approval tool call run, and returns its output. */
+	runApprovedTool(toolCallId: string, signal: AbortSignal | undefined): Promise<ApprovedToolResult>;
 	abandonParkedTurn(reason?: string): void;
-	/** Disposes child processes and the in-memory MCP server. */
 	dispose(): Promise<void>;
 }
 
@@ -160,13 +186,13 @@ function toPiModel(
 	id: string,
 	name: string,
 	thinkingMap: ThinkingLevelMap | undefined,
-): Model<typeof AGY_ACP_API> {
+): Model<typeof AGY_API> {
 	return {
 		id,
 		name,
-		api: AGY_ACP_API,
-		provider: AGY_ACP_PROVIDER_ID,
-		baseUrl: `acp://${AGY_ACP_PROVIDER_ID}`,
+		api: AGY_API,
+		provider: AGY_PROVIDER_ID,
+		baseUrl: `acp://${AGY_PROVIDER_ID}`,
 		reasoning: thinkingMap !== undefined,
 		...(thinkingMap ? { thinkingLevelMap: thinkingMap } : {}),
 		input: ["text", "image"],
@@ -177,7 +203,7 @@ function toPiModel(
 }
 
 /** Converts an `agy acp` `session/new` config snapshot into Pi `Model` records. */
-export function modelsFromSessionConfig(config: AcpSessionConfig): Model<typeof AGY_ACP_API>[] {
+export function modelsFromSessionConfig(config: AcpSessionConfig): Model<typeof AGY_API>[] {
 	const choices = config.model?.choices ?? [];
 	const variants = config.availableModelVariants;
 	const defaultThoughtChoices = config.thoughtLevel?.choices;
@@ -191,7 +217,7 @@ export function modelsFromSessionConfig(config: AcpSessionConfig): Model<typeof 
 const STANDARD_THINKING = buildThinkingLevelMap(new Set(["low", "medium", "high"]));
 const EXTENDED_THINKING = buildThinkingLevelMap(new Set(["low", "medium", "high", "xhigh"]));
 
-export const BASELINE_MODELS: readonly Model<typeof AGY_ACP_API>[] = [
+export const BASELINE_MODELS: readonly Model<typeof AGY_API>[] = [
 	toPiModel("gemini-4-neon", "Gemini 4 Neon", EXTENDED_THINKING),
 	toPiModel("gemini-4-carbon", "Gemini 4 Carbon", STANDARD_THINKING),
 	toPiModel("gemini-4-argon", "Gemini 4 Argon", STANDARD_THINKING),
@@ -324,37 +350,50 @@ function createMessageWriter(stream: AssistantMessageEventStream, message: Assis
 
 type MessageWriter = ReturnType<typeof createMessageWriter>;
 
+
+
+
+/** An Agy tool call waiting in the `pi-gate` hook for Pi's decision. */
+interface ParkedHook {
+	id: string;
+	call: HookToolCall;
+	subagent: boolean;
+	answered: boolean;
+	answer(decision: HookDecision): void;
+}
+
 type PhaseEnd =
-	| { kind: "parked"; calls: ParkedToolCall[] }
+	| { kind: "parked"; hooks: ParkedHook[] }
 	| { kind: "done"; result: AcpPromptResult }
 	| { kind: "error"; error: Error }
 	| { kind: "aborted" };
 
+type ToolUpdate = Extract<AcpSessionUpdate, { type: "tool_call" | "tool_call_update" }>;
+
 interface ActiveBridge {
 	sessionId: string;
 	model: Model<Api>;
-	cwd: string;
-	systemPromptHash: string;
 	promptController: AbortController;
+	/** Bumped by a steering prompt; Agy resolves the earlier prompt at once. */
+	promptGeneration: number;
 	writer: MessageWriter | null;
 	onRawUpdate?: (params: unknown) => void;
 	detachSignal: (() => void) | null;
 	bufferedUpdates: AcpSessionUpdate[];
-	pendingParks: ParkedToolCall[];
-	awaitingResults: Map<string, ParkedToolCall>;
+	pendingParks: ParkedHook[];
+	awaitingResults: Map<string, ParkedHook>;
 	parkBatchTimer: NodeJS.Timeout | null;
 	phaseResolve: ((end: PhaseEnd) => void) | null;
 	terminalOutcome: { kind: "done"; result: AcpPromptResult } | { kind: "error"; error: Error } | null;
 	latestUsageUpdate: { used: number; size: number } | null;
 	stepCount: number;
 	aborted: boolean;
+	finishedTools: Map<string, ToolUpdate>;
+	toolWaiters: Map<string, Array<(update: ToolUpdate | undefined) => void>>;
 }
 
 interface BoundSession {
 	acpSessionId: string;
-	cwd: string;
-	systemPromptHash: string;
-	syncedFingerprint: string;
 	lastModelId: string | undefined;
 	lastThoughtLevel: string | undefined;
 }
@@ -446,107 +485,184 @@ function finishFromStopReason(writer: MessageWriter, stopReason: AcpPromptResult
 	}
 }
 
-export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProviderHandle {
+
+const stringArg = (args: Record<string, unknown>, ...names: string[]): string | undefined => {
+	for (const name of names) {
+		const value = args[name];
+		if (typeof value === "string" && value.length > 0) return value;
+	}
+	return undefined;
+};
+
+/** The Pi approval tool call that stands in for one Agy tool call. */
+export function approvalToolCall(
+	call: HookToolCall,
+	subagent: boolean,
+	cwd: string,
+): { name: string; arguments: Record<string, unknown> } {
+	const marker = subagent ? { subagent: true } : {};
+	const path = stringArg(call.args, "Path", "AbsolutePath", "TargetFile");
+	switch (call.toolName) {
+		case "run_command": {
+			const command = stringArg(call.args, "CommandLine");
+			if (command) return { name: AGY_COMMAND_TOOL, arguments: { command, cwd: stringArg(call.args, "Cwd") ?? cwd, ...marker } };
+			break;
+		}
+		case "read_file":
+		case "view_file":
+			// Pi's own read gets the read-only path rules. If Pi cannot run it, the call fails and Agy is denied.
+			if (path) return { name: "read", arguments: { path } };
+			break;
+		case "edit_file":
+		case "write_file":
+			if (path) return { name: AGY_EDIT_TOOL, arguments: { path, ...marker } };
+			break;
+	}
+	// A top-level path lets Pi's path rules see the file the call touches.
+	return { name: AGY_OTHER_TOOL, arguments: { tool: call.toolName, arguments: call.args, ...(path ? { path } : {}), ...marker } };
+}
+
+function toolResultText(result: ToolResultMessage): string {
+	return result.content.map((part) => (part.type === "text" ? part.text : "")).join("\n").trim();
+}
+
+function renderToolUpdate(update: ToolUpdate | undefined): ApprovedToolResult {
+	if (!update) return { text: "Agy reported no output for this tool call.", isError: false };
+	const isError = update.status === "failed";
+	const raw = update.rawOutput;
+	if (isRecord(raw)) {
+		const lines: string[] = [];
+		if (typeof raw.output === "string") lines.push(raw.output);
+		if (typeof raw.exit_code === "number" && raw.exit_code !== 0) lines.push(`(exit code ${raw.exit_code})`);
+		if (lines.length > 0) return { text: lines.join("\n"), isError };
+	}
+	if (Array.isArray(update.content)) {
+		const texts = update.content.flatMap((item: unknown) => {
+			if (!isRecord(item)) return [];
+			if (item.type === "content" && isRecord(item.content) && typeof item.content.text === "string") return [item.content.text];
+			if (item.type === "diff" && typeof item.path === "string") return [`Edited ${item.path}`];
+			return [];
+		});
+		if (texts.length > 0) return { text: texts.join("\n"), isError };
+	}
+	if (typeof raw === "string" && raw) return { text: raw, isError };
+	if (raw !== undefined) return { text: JSON.stringify(raw), isError };
+	return { text: isError ? "Agy reported that the tool call failed." : "Done.", isError };
+}
+
+const userText = (message: Message): string =>
+	message.role === "user"
+		? typeof message.content === "string"
+			? message.content
+			: message.content.map((part) => (part.type === "text" ? part.text : "")).join("")
+		: "";
+
+/** Drops what Agy must not be sent: Pi's own declines and the results of Agy's approval tool calls. */
+function forwardable(messages: readonly Message[], all: readonly Message[]): Message[] {
+	const agyCallIds = new Set(
+		all.flatMap((message) =>
+			message.role === "assistant" && message.provider === AGY_PROVIDER_ID
+				? message.content.flatMap((part) => (part.type === "toolCall" ? [part.id] : []))
+				: [],
+		),
+	);
+	return messages.filter((message) => {
+		if (message.role === "system") return false;
+		if (message.role === "assistant") return message.responseId !== DECLINED_RESPONSE_ID;
+		if (message.role === "toolResult") return !agyCallIds.has(message.toolCallId);
+		return userText(message).trim().length > 0 || (typeof message.content !== "string" && message.content.length > 0);
+	});
+}
+
+/** Pi's own transcript size, so Pi's context meter and compaction ignore Agy's separate history. */
+function piTranscriptTokens(context: TranscriptContext, message: AssistantMessage): number {
+	let total = estimateTokens(message);
+	for (const entry of context.messages) if (entry.role !== "system") total += estimateTokens(entry);
+	return total;
+}
+
+export function createAgyNativeProvider(options: AgyNativeProviderOptions): AgyNativeProviderHandle {
 	const log = options.log ?? (() => {});
 	const parkBatchMs = options.parkBatchMs ?? DEFAULT_PARK_BATCH_MS;
-	const auxIdleMs = options.auxIdleMs ?? DEFAULT_AUX_IDLE_MS;
+	const hookDeadlineMs = options.hookDeadlineMs ?? DEFAULT_HOOK_DEADLINE_MS;
 
-	let models: Model<typeof AGY_ACP_API>[] = [...BASELINE_MODELS];
+	let models: Model<typeof AGY_API>[] = [...BASELINE_MODELS];
 	let activePiSessionId: string | undefined;
 	let pendingLiveSignal: AbortSignal | undefined;
 	let activeCwd = process.cwd();
-	let persistedBinding: PersistedAcpBinding | undefined;
 	let boundSession: BoundSession | null = null;
 	let activeBridge: ActiveBridge | null = null;
-
-	let mcpServer: McpBridgeServer | null = null;
-	let mcpStarting: Promise<McpBridgeServer> | null = null;
-	let mainTransport: AcpTransport | null = null;
-	let auxTransport: AcpTransport | null = null;
-	let auxInFlight = 0;
-	let auxIdleTimer: NodeJS.Timeout | null = null;
+	let transport: AcpTransport | null = null;
+	let hookSeq = 0;
+	/** Agy tool calls Pi approved; Agy's own permission prompt for them is answered with allow. */
+	const approvedToolCalls = new Set<string>();
 
 	const checkAvailable = (): boolean =>
 		options.checkAvailable ? options.checkAvailable() : resolveAgyBinary(options.binaryPath) !== undefined;
 
-	const ensureMcpServer = async (): Promise<McpBridgeServer> => {
-		if (mcpServer) return mcpServer;
-		mcpStarting ??= (async () => {
-			const server = options.createMcpServer ? options.createMcpServer() : new McpBridgeServer();
-			await server.start();
-			mcpServer = server;
-			return server;
-		})().catch((error) => {
-			mcpStarting = null;
-			throw error;
+	const deny = (reason: string): HookDecision => ({ decision: "deny", reason });
+
+	const onGateRequest = ({ call, closed }: GateRequest): Promise<HookDecision> => {
+		const bridge = activeBridge;
+		if (!bridge || bridge.aborted) {
+			log(`hook ${call.toolName} denied: no Pi turn running`);
+			return Promise.resolve(deny("No Pi turn is running, so Pi cannot approve this tool call."));
+		}
+		return new Promise<HookDecision>((resolvePromise) => {
+			const park: ParkedHook = {
+				id: call.toolCallId ?? `agy-hook-${++hookSeq}`,
+				call,
+				subagent: call.conversationId !== undefined && call.conversationId !== bridge.sessionId,
+				answered: false,
+				answer(decision) {
+					if (park.answered) return;
+					park.answered = true;
+					clearTimeout(timer);
+					if (decision.decision === "auto_approve") approvedToolCalls.add(park.id);
+					log(`hook ${call.toolName} ${park.id} -> ${decision.decision}`);
+					resolvePromise(decision);
+				},
+			};
+			const timer = setTimeout(
+				() => park.answer(deny(`Pi did not answer within ${Math.round(hookDeadlineMs / 60_000)} minutes.`)),
+				hookDeadlineMs,
+			);
+			timer.unref();
+			void closed.then(() => {
+				if (park.answered) return;
+				park.answered = true;
+				clearTimeout(timer);
+				bridge.pendingParks = bridge.pendingParks.filter((pending) => pending !== park);
+			});
+			bridge.pendingParks.push(park);
+			if (!bridge.parkBatchTimer) {
+				bridge.parkBatchTimer = setTimeout(() => flushPendingParks(bridge), parkBatchMs);
+				bridge.parkBatchTimer.unref();
+			}
 		});
-		return mcpStarting;
 	};
 
-	const ensureMainTransport = async (): Promise<{ transport: AcpTransport; mcp: McpBridgeServer }> => {
-		const mcp = await ensureMcpServer();
-		if (!mainTransport) {
-			const endpoint = { url: mcp.url, token: mcp.authToken };
-			mainTransport = options.createMainTransport
-				? options.createMainTransport(endpoint)
-				: new AgyAcpClient({
-						binaryPath: options.binaryPath,
-						cacheDir: options.cacheDir,
-						mcpEndpoint: endpoint,
-						log: (msg) => log(`main: ${msg}`),
-					});
-		}
-		return { transport: mainTransport, mcp };
-	};
+	const gate = new GateServer(onGateRequest);
 
-	const disposeAuxTransport = (): void => {
-		if (auxIdleTimer) {
-			clearTimeout(auxIdleTimer);
-			auxIdleTimer = null;
-		}
-		if (auxTransport) {
-			auxTransport.dispose();
-			auxTransport = null;
-		}
-	};
-
-	const acquireAuxTransport = (): AcpTransport => {
-		if (auxIdleTimer) {
-			clearTimeout(auxIdleTimer);
-			auxIdleTimer = null;
-		}
-		auxInFlight += 1;
-		if (!auxTransport) {
-			auxTransport = options.createAuxTransport
-				? options.createAuxTransport()
-				: new AgyAcpClient({
-						binaryPath: options.binaryPath,
-						cacheDir: options.cacheDir,
-						mcpEndpoint: undefined,
-						ephemeral: true,
-						log: (msg) => log(`aux: ${msg}`),
-					});
-		}
-		return auxTransport;
-	};
-
-	const releaseAuxTransport = (immediate = false): void => {
-		auxInFlight = Math.max(0, auxInFlight - 1);
-		if (auxInFlight > 0 || !auxTransport) return;
-		if (immediate || auxIdleMs <= 0) {
-			disposeAuxTransport();
-			return;
-		}
-		if (auxIdleTimer) clearTimeout(auxIdleTimer);
-		auxIdleTimer = setTimeout(() => {
-			auxIdleTimer = null;
-			if (auxInFlight === 0) disposeAuxTransport();
-		}, auxIdleMs);
-		auxIdleTimer.unref();
+	const ensureTransport = async (): Promise<AcpTransport> => {
+		if (transport) return transport;
+		(options.installGate ?? (() => installHook({ scriptPath: join(options.cacheDir, "pi-gate-hook.mjs") })))();
+		const url = await gate.start();
+		const env = { [GATE_URL_ENV]: url };
+		const allowPermission = (toolCallId: string | undefined) => toolCallId !== undefined && approvedToolCalls.has(toolCallId);
+		transport = options.createTransport
+			? options.createTransport(env, allowPermission)
+			: new AgyAcpClient({
+					binaryPath: options.binaryPath,
+					env,
+					onPermissionRequest: (request) => allowPermission(request.toolCallId),
+					log: (msg) => log(`acp: ${msg}`),
+				});
+		return transport;
 	};
 
 	const takeLiveRequest = (streamOptions: StreamOptions | undefined): boolean => {
-		// Pi 1.6.0 dist/core/sdk.js installs this observer on the agent loop.
+		// Pi 1.6 dist/core/sdk.js installs this observer on the agent loop.
 		// A nested streamSimple call can share both ctx.signal and sessionId.
 		if (
 			!pendingLiveSignal ||
@@ -562,6 +678,11 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 		return true;
 	};
 
+	const releaseToolWaiters = (bridge: ActiveBridge): void => {
+		for (const waiters of bridge.toolWaiters.values()) for (const wake of waiters) wake(undefined);
+		bridge.toolWaiters.clear();
+	};
+
 	const clearBridge = (bridge: ActiveBridge, cancelRemote: boolean, reason: string): void => {
 		if (bridge.parkBatchTimer) {
 			clearTimeout(bridge.parkBatchTimer);
@@ -571,24 +692,24 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 		bridge.detachSignal = null;
 		bridge.writer = null;
 		bridge.onRawUpdate = undefined;
+		releaseToolWaiters(bridge);
 
 		if (cancelRemote) {
 			bridge.aborted = true;
-			for (const park of bridge.pendingParks) park.reject(reason);
+			for (const park of bridge.pendingParks) park.answer(deny(reason));
 			bridge.pendingParks = [];
-			for (const park of bridge.awaitingResults.values()) park.reject(reason);
+			for (const park of bridge.awaitingResults.values()) park.answer(deny(reason));
 			bridge.awaitingResults.clear();
-			mcpServer?.failAllParks(reason);
 			bridge.promptController.abort();
 		}
 
 		if (activeBridge === bridge) {
 			activeBridge = null;
-			mcpServer?.setParkHandler(undefined, undefined);
+			transport?.setUpdateListener(bridge.sessionId, undefined);
 		}
 	};
 
-	const abandonParkedTurn = (reason = "Pi ended the turn before tool results were delivered."): void => {
+	const abandonParkedTurn = (reason = "Pi ended the turn before deciding on this tool call."): void => {
 		pendingLiveSignal = undefined;
 		if (!activeBridge) return;
 		const bridge = activeBridge;
@@ -603,13 +724,20 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 			bridge.latestUsageUpdate = { used: update.used, size: update.size };
 			return;
 		}
-		if (update.type !== "agent_message_chunk" && update.type !== "agent_thought_chunk") return;
+		if (update.type === "tool_call" || update.type === "tool_call_update") {
+			if (update.status !== "completed" && update.status !== "failed") return;
+			bridge.finishedTools.set(update.toolCallId, update);
+			const waiters = bridge.toolWaiters.get(update.toolCallId);
+			bridge.toolWaiters.delete(update.toolCallId);
+			for (const wake of waiters ?? []) wake(update);
+			return;
+		}
 		if (!bridge.writer || bridge.writer.isSettled) {
 			bridge.bufferedUpdates.push(update);
 			return;
 		}
 		if (update.type === "agent_message_chunk") bridge.writer.append("text", update.text);
-		else bridge.writer.append("thinking", update.text);
+		else if (update.type === "agent_thought_chunk") bridge.writer.append("thinking", update.text);
 	};
 
 	const flushBufferedUpdates = (bridge: ActiveBridge): void => {
@@ -637,18 +765,22 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 		bridge.detachSignal = () => signal.removeEventListener("abort", onAbort);
 	};
 
+	const takePendingParks = (bridge: ActiveBridge): ParkedHook[] => {
+		const hooks = bridge.pendingParks.filter((park) => !park.answered);
+		bridge.pendingParks = [];
+		for (const park of hooks) bridge.awaitingResults.set(park.id, park);
+		return hooks;
+	};
+
 	const flushPendingParks = (bridge: ActiveBridge): void => {
 		if (bridge.parkBatchTimer) {
 			clearTimeout(bridge.parkBatchTimer);
 			bridge.parkBatchTimer = null;
 		}
 		if (bridge.pendingParks.length === 0 || !bridge.phaseResolve) return;
-		const calls = bridge.pendingParks;
-		bridge.pendingParks = [];
-		for (const call of calls) bridge.awaitingResults.set(call.callId, call);
 		const resolve = bridge.phaseResolve;
 		bridge.phaseResolve = null;
-		resolve({ kind: "parked", calls });
+		resolve({ kind: "parked", hooks: takePendingParks(bridge) });
 	};
 
 	const awaitBridgePhase = (bridge: ActiveBridge): Promise<PhaseEnd> => {
@@ -658,40 +790,71 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 			bridge.terminalOutcome = null;
 			return Promise.resolve(outcome);
 		}
-		if (bridge.pendingParks.length > 0) {
-			const calls = bridge.pendingParks;
-			bridge.pendingParks = [];
-			for (const call of calls) bridge.awaitingResults.set(call.callId, call);
-			return Promise.resolve({ kind: "parked", calls });
+		if (bridge.pendingParks.some((park) => !park.answered)) {
+			return Promise.resolve({ kind: "parked", hooks: takePendingParks(bridge) });
 		}
 		return new Promise<PhaseEnd>((resolve) => {
 			bridge.phaseResolve = resolve;
 		});
 	};
 
-	const settleMainPhase = (
+	const sendPrompt = (bridge: ActiveBridge, prompt: AcpPromptBlock[], steer: boolean): void => {
+		const generation = ++bridge.promptGeneration;
+		const active = transport;
+		if (!active) return;
+		void active
+			.prompt({ sessionId: bridge.sessionId, prompt, signal: bridge.promptController.signal, steer })
+			.then(
+				(result): PhaseEnd => {
+					log(`raw ACP usage sid=${bridge.sessionId}: ${JSON.stringify(result.usage ?? null)}`);
+					return { kind: "done", result };
+				},
+				(error: unknown): PhaseEnd => ({ kind: "error", error: error instanceof Error ? error : new Error(String(error)) }),
+			)
+			.then((outcome) => {
+				if (bridge.aborted || generation !== bridge.promptGeneration || outcome.kind === "parked" || outcome.kind === "aborted") return;
+				releaseToolWaiters(bridge);
+				const resolve = bridge.phaseResolve;
+				bridge.phaseResolve = null;
+				if (resolve) resolve(outcome);
+				else bridge.terminalOutcome = outcome;
+			});
+	};
+
+	const newMessage = (model: Model<Api>): AssistantMessage => ({
+		role: "assistant",
+		content: [],
+		api: model.api,
+		provider: model.provider,
+		model: model.id,
+		usage: zeroUsage(),
+		stopReason: "pending",
+		timestamp: Date.now(),
+	});
+
+	const settlePhase = (
 		bridge: ActiveBridge,
 		phase: PhaseEnd,
 		writer: MessageWriter,
 		message: AssistantMessage,
 		context: TranscriptContext,
-		model: Model<Api>,
 	): void => {
 		bridge.detachSignal?.();
 		bridge.detachSignal = null;
 		bridge.writer = null;
 		bridge.onRawUpdate = undefined;
+		message.usage.totalTokens = piTranscriptTokens(context, message);
 
 		if (phase.kind === "parked") {
 			bridge.stepCount += 1;
-			for (const call of phase.calls) {
-				writer.emitToolCall(call.callId, call.piName, call.args);
+			for (const park of phase.hooks) {
+				const call = approvalToolCall(park.call, park.subagent, activeCwd);
+				writer.emitToolCall(park.id, call.name, call.arguments);
 			}
 			writer.done("toolUse");
 			return;
 		}
 
-		// Terminal outcome for this ACP prompt turn.
 		clearBridge(bridge, false, "");
 
 		if (phase.kind === "aborted") {
@@ -704,137 +867,73 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 		}
 
 		const { result } = phase;
-		message.usage = normalizeTurnUsage(model, result.usage, bridge.latestUsageUpdate, bridge.stepCount);
+		message.usage = normalizeTurnUsage(bridge.model, result.usage, bridge.latestUsageUpdate, bridge.stepCount);
+		message.usage.totalTokens = piTranscriptTokens(context, message);
 		const terminalError = terminalAcpError(message, result);
 		if (terminalError) {
 			writer.fail("error", terminalError);
 			return;
 		}
 		finishFromStopReason(writer, result.stopReason);
-
-		if (result.stopReason === "end_turn" || result.stopReason === "max_tokens" || result.stopReason === "max_turn_requests") {
-			const syncedFingerprint = fingerprintMessages([...context.messages, message]);
-			if (boundSession && boundSession.acpSessionId === bridge.sessionId) {
-				boundSession.syncedFingerprint = syncedFingerprint;
-			}
-			if (activePiSessionId) {
-				const binding: PersistedAcpBinding = {
-					configurationVersion: ACP_CONFIGURATION_VERSION,
-					piSessionId: activePiSessionId,
-					acpSessionId: bridge.sessionId,
-					syncedFingerprint,
-					systemPromptHash: bridge.systemPromptHash,
-					cwd: bridge.cwd,
-					modelId: model.id,
-				};
-				persistedBinding = binding;
-				options.onBindingChange?.(binding);
-			}
-		}
 	};
 
-	async function runAuxiliaryTurn(
+	const declineTurn = (writer: MessageWriter, message: AssistantMessage, text: string): void => {
+		message.responseId = DECLINED_RESPONSE_ID;
+		writer.append("text", text);
+		writer.done("stop");
+	};
+
+	/** Answers parked hooks from Pi's tool results; returns false if the results do not match. */
+	const resumeParkedTurn = async (
+		bridge: ActiveBridge,
+		writer: MessageWriter,
+		message: AssistantMessage,
+		context: TranscriptContext,
+		model: Model<Api>,
+		streamOptions: StreamOptions | undefined,
+		onRawUpdate: ((raw: unknown) => void) | undefined,
+	): Promise<boolean> => {
+		const tail = extractPostAssistantTail(context.messages);
+		const resultById = new Map((tail?.toolResults ?? []).map((result) => [result.toolCallId, result]));
+		if (!tail || bridge.model.id !== model.id || ![...bridge.awaitingResults.keys()].every((id) => resultById.has(id))) {
+			return false;
+		}
+		message.responseId = `${SESSION_RESPONSE_PREFIX}${bridge.sessionId}`;
+		writer.ensureStarted();
+		bridge.writer = writer;
+		bridge.onRawUpdate = onRawUpdate;
+		attachSignalToBridge(bridge, streamOptions?.signal);
+
+		const hooks = [...bridge.awaitingResults.values()];
+		bridge.awaitingResults.clear();
+		for (const park of hooks) {
+			const result = resultById.get(park.id)!;
+			if (result.isError) park.answer(deny(toolResultText(result) || "Pi blocked this tool call."));
+			else park.answer({ decision: "auto_approve" });
+		}
+		if (tail.steeringTexts.length > 0 || tail.steeringImages.length > 0) {
+			const steering: AcpPromptBlock[] = [
+				...tail.steeringTexts.map((text): AcpPromptBlock => ({ type: "text", text })),
+				...tail.steeringImages.map((image): AcpPromptBlock => ({ type: "image", data: image.data, mimeType: image.mimeType })),
+			];
+			log(`steering prompt sid=${bridge.sessionId}`);
+			sendPrompt(bridge, steering, true);
+		}
+		flushBufferedUpdates(bridge);
+		const phase = await awaitBridgePhase(bridge);
+		settlePhase(bridge, phase, writer, message, context);
+		return true;
+	};
+
+	async function runTurn(
 		stream: AssistantMessageEventStream,
 		model: Model<Api>,
 		context: TranscriptContext,
 		streamOptions: StreamOptions | undefined,
 	): Promise<void> {
 		const signal = streamOptions?.signal;
-		const message: AssistantMessage = {
-			role: "assistant",
-			content: [],
-			api: model.api,
-			provider: model.provider,
-			model: model.id,
-			usage: zeroUsage(),
-			stopReason: "pending",
-			timestamp: Date.now(),
-		};
+		const message = newMessage(model);
 		const writer = createMessageWriter(stream, message);
-		const promptBlocks = renderTranscriptReplay(context.messages);
-		if (!promptBlocks) {
-			writer.fail("error", "No prompt content to send to Antigravity ACP.");
-			return;
-		}
-		let systemPrompt: string;
-		try {
-			systemPrompt = renderSystemPromptAppend(context.messages, log);
-		} catch (error) {
-			writer.fail("error", errorMessage(error));
-			return;
-		}
-		const transport = acquireAuxTransport();
-		let sessionId: string | undefined;
-		let latestUsageUpdate: { used: number; size: number } | null = null;
-
-		try {
-			const created = await transport.createSession({
-				cwd: activeCwd,
-				systemPromptAppend: systemPrompt || undefined,
-				signal,
-			});
-			sessionId = created.sessionId;
-			const reasoning = (streamOptions as SimpleStreamOptions | undefined)?.reasoning;
-			await applySessionModelAndThinking(transport, sessionId, model, reasoning, true, undefined, undefined, signal);
-
-			writer.ensureStarted();
-			const defaultPayload = { sessionId, prompt: promptBlocks };
-			const rewritten = (await streamOptions?.onPayload?.(defaultPayload, model)) as
-				| { prompt?: AcpPromptBlock[] }
-				| undefined;
-			const finalPrompt = rewritten?.prompt ?? promptBlocks;
-
-			log(`aux full transcript replay: standalone request sid=${sessionId}`);
-			const result = await transport.prompt({
-				sessionId,
-				prompt: finalPrompt,
-				signal,
-				onRawUpdate: streamOptions?.onProviderStreamEvent
-					? (raw) => {
-							void Promise.resolve(streamOptions.onProviderStreamEvent?.(raw, model)).catch((err) =>
-								log(`onProviderStreamEvent failed: ${errorMessage(err)}`),
-							);
-						}
-					: undefined,
-				onUpdate: (update) => {
-					if (update.type === "usage_update") latestUsageUpdate = { used: update.used, size: update.size };
-					else if (update.type === "agent_message_chunk") writer.append("text", update.text);
-					else if (update.type === "agent_thought_chunk") writer.append("thinking", update.text);
-				},
-			});
-			log(`aux raw ACP usage sid=${sessionId}: ${JSON.stringify(result.usage ?? null)}`);
-			message.usage = normalizeTurnUsage(model, result.usage, latestUsageUpdate, 1);
-			const terminalError = terminalAcpError(message, result);
-			if (terminalError) writer.fail("error", terminalError);
-			else finishFromStopReason(writer, result.stopReason);
-		} catch (error) {
-			if (signal?.aborted) writer.fail("aborted", "Request was aborted");
-			else writer.fail("error", errorMessage(error));
-		} finally {
-			if (sessionId) await transport.closeSession(sessionId);
-			releaseAuxTransport(false);
-		}
-	}
-
-	async function runMainTurn(
-		stream: AssistantMessageEventStream,
-		model: Model<Api>,
-		context: TranscriptContext,
-		streamOptions: StreamOptions | undefined,
-	): Promise<void> {
-		const signal = streamOptions?.signal;
-		const message: AssistantMessage = {
-			role: "assistant",
-			content: [],
-			api: model.api,
-			provider: model.provider,
-			model: model.id,
-			usage: zeroUsage(),
-			stopReason: "pending",
-			timestamp: Date.now(),
-		};
-		const writer = createMessageWriter(stream, message);
-
 		const onRawUpdate = streamOptions?.onProviderStreamEvent
 			? (raw: unknown) => {
 					void Promise.resolve(streamOptions.onProviderStreamEvent?.(raw, model)).catch((err) =>
@@ -843,164 +942,70 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 				}
 			: undefined;
 
-		// Case 1: Resume an active parked ACP turn if matching tool results arrived.
-		if (activeBridge && activeBridge.awaitingResults.size > 0) {
+		if (activeBridge) {
 			const bridge = activeBridge;
-			const tail = extractPostAssistantTail(context.messages);
-			const resultById = new Map((tail?.toolResults ?? []).map((r) => [r.toolCallId, r]));
-			const allMatched =
-				tail !== null &&
-				bridge.model.id === model.id &&
-				bridge.cwd === activeCwd &&
-				[...bridge.awaitingResults.keys()].every((id) => resultById.has(id));
-
-			if (allMatched && tail) {
-				try {
-					const mcp = await ensureMcpServer();
-					await mcp.updateTools(projectPiTools(getCurrentTools(context.messages)));
-				} catch (error) {
-					log(`tool update before unpark failed: ${errorMessage(error)}`);
-				}
-
-				writer.ensureStarted();
-				bridge.writer = writer;
-				bridge.onRawUpdate = onRawUpdate;
-				attachSignalToBridge(bridge, signal);
-				flushBufferedUpdates(bridge);
-
-				const deliveries = [...bridge.awaitingResults.values()];
-				bridge.awaitingResults.clear();
-
-				const steeringText =
-					tail.steeringTexts.length > 0
-						? `\n\n[User steering message received during tool execution]:\n${tail.steeringTexts.join("\n")}`
-						: "";
-				const steeringImages: ImageContent[] = tail.steeringImages;
-
-				const phasePromise = awaitBridgePhase(bridge);
-
-				for (let i = 0; i < deliveries.length; i++) {
-					const park = deliveries[i];
-					const toolRes = resultById.get(park.callId)!;
-					const content: (TextContent | ImageContent)[] = [...toolRes.content];
-					if (i === deliveries.length - 1) {
-						if (steeringText) content.push({ type: "text", text: steeringText });
-						if (steeringImages.length > 0) content.push(...steeringImages);
-					}
-					park.resolve({ content, isError: toolRes.isError });
-				}
-
-				const phase = await phasePromise;
-				settleMainPhase(bridge, phase, writer, message, context, model);
-				return;
-			}
-
-			// Transcript diverged (e.g. threshold compaction ran mid-loop) — abort parked turn cleanly.
-			abandonParkedTurn("Pi transcript changed before tool results were delivered.");
+			if (bridge.awaitingResults.size > 0 &&
+				await resumeParkedTurn(bridge, writer, message, context, model, streamOptions, onRawUpdate)) return;
+			abandonParkedTurn("Pi transcript changed before deciding on this tool call.");
 		}
 
-		// Case 2: Start a fresh ACP prompt turn (reusing/resuming warm session if continuity matches).
-		let systemPrompt: string;
-		let systemPromptHash: string;
+		const conversation = context.messages.filter((entry) => entry.role !== "system");
+		const lastAssistant = conversation.findLastIndex((entry) => entry.role === "assistant");
+		if (!conversation.slice(lastAssistant + 1).some((entry) => entry.role === "user")) {
+			declineTurn(writer, message, TYPED_ONLY_REPLY);
+			return;
+		}
+
+		let active: AcpTransport;
 		try {
-			const sources = options.getPromptSources?.();
-			systemPrompt = renderSystemPromptAppend(context.messages, log, sources);
-			systemPromptHash = hashSystemPromptAppend(context.messages, sources);
+			active = await ensureTransport();
 		} catch (error) {
 			writer.fail("error", errorMessage(error));
 			return;
 		}
-		const projectedTools = projectPiTools(getCurrentTools(context.messages));
 
-		let transport: AcpTransport;
-		let mcp: McpBridgeServer;
-		try {
-			({ transport, mcp } = await ensureMainTransport());
-			await mcp.updateTools(projectedTools);
-		} catch (error) {
-			if (signal?.aborted) writer.fail("aborted", "Request was aborted");
-			else writer.fail("error", errorMessage(error));
-			return;
-		}
-
-		const binding = boundSession ?? (persistedBinding?.piSessionId === activePiSessionId ? persistedBinding : undefined);
-		let delta = binding?.cwd === activeCwd ? messagesAfterFingerprint(context.messages, binding.syncedFingerprint) : null;
-		let session = delta !== null ? boundSession : null;
-		let replayReason = !binding
-			? "cold start (no ACP session)"
-			: binding.cwd !== activeCwd ? "working directory changed" : "diverged prefix";
+		const view = options.getSessionView?.() ?? viewFromMessages(context.messages);
+		const mark = view.branchMark;
+		const continuable = mark !== undefined && !view.retired.has(mark.acpSessionId) &&
+			view.latestTimestamp(mark.acpSessionId) === mark.timestamp;
+		let session: BoundSession | null = null;
 		let needApplySettings = false;
-		let sessionId: string;
 
 		try {
-			// An append changed during a parked turn is applied here, after that ACP prompt finishes.
-			if (delta !== null && binding && (!session || session.systemPromptHash !== systemPromptHash)) {
-				try {
-					await transport.resumeSession({
-						sessionId: binding.acpSessionId,
-						cwd: activeCwd,
-						systemPromptAppend: systemPrompt,
-						signal,
-					});
-					session = {
-						acpSessionId: binding.acpSessionId,
-						cwd: activeCwd,
-						systemPromptHash,
-						syncedFingerprint: binding.syncedFingerprint,
-						lastModelId: undefined,
-						lastThoughtLevel: undefined,
-					};
-					// agy resets the model on session/resume.
-					needApplySettings = true;
-				} catch (error) {
-					if (session) {
-						log(`main session/resume failed sid=${session.acpSessionId}; keeping previous system append: ${errorMessage(error)}`);
-					} else {
-						log(`main session/resume failed sid=${binding.acpSessionId}: ${errorMessage(error)}`);
-						replayReason = "session/resume failed";
+			if (continuable) {
+				if (boundSession?.acpSessionId === mark.acpSessionId) {
+					session = boundSession;
+				} else {
+					try {
+						await active.resumeSession({ sessionId: mark.acpSessionId, cwd: activeCwd, signal });
+						session = { acpSessionId: mark.acpSessionId, lastModelId: undefined, lastThoughtLevel: undefined };
+						// agy resets the model on session/resume.
+						needApplySettings = true;
+					} catch (error) {
+						if (signal?.aborted) throw error;
+						log(`session/resume failed sid=${mark.acpSessionId}: ${errorMessage(error)}`);
 					}
 				}
 			}
-
 			if (!session) {
-				delta = null;
-				persistedBinding = undefined;
-				if (boundSession) {
-					await transport.closeSession(boundSession.acpSessionId);
-					boundSession = null;
-				}
-				log(`main createSession cwd=${activeCwd} sysLen=${systemPrompt.length} tools=${projectedTools.map(t=>t.mcpName).join(",")}`);
-				const created = await transport.createSession({
-					cwd: activeCwd,
-					systemPromptAppend: systemPrompt || undefined,
-					signal,
-				});
-				log(`main createSession ok sid=${created.sessionId}`);
-				session = {
-					acpSessionId: created.sessionId,
-					cwd: activeCwd,
-					systemPromptHash,
-					syncedFingerprint: "",
-					lastModelId: undefined,
-					lastThoughtLevel: undefined,
-				};
+				if (boundSession) await active.closeSession(boundSession.acpSessionId);
+				boundSession = null;
+				const created = await active.createSession({ cwd: activeCwd, signal });
+				log(`session/new sid=${created.sessionId}`);
+				session = { acpSessionId: created.sessionId, lastModelId: undefined, lastThoughtLevel: undefined };
 				needApplySettings = true;
 			}
-
 			boundSession = session;
-			sessionId = session.acpSessionId;
-			const reasoning = (streamOptions as SimpleStreamOptions | undefined)?.reasoning;
 			const applied = await applySessionModelAndThinking(
-				transport,
-				sessionId,
+				active,
+				session.acpSessionId,
 				model,
-				reasoning,
+				(streamOptions as SimpleStreamOptions | undefined)?.reasoning,
 				needApplySettings,
 				session.lastModelId,
 				session.lastThoughtLevel,
 				signal,
 			);
-			log(`main applied model=${applied.modelId} thought=${applied.thoughtLevel}`);
 			session.lastModelId = applied.modelId;
 			session.lastThoughtLevel = applied.thoughtLevel;
 		} catch (error) {
@@ -1009,21 +1014,26 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 			return;
 		}
 
-		const promptBlocks: AcpPromptBlock[] | null = delta === null
-			? renderTranscriptReplay(context.messages)
-			: delta.length === 0
-				? [{ type: "text", text: "Continue the conversation." }]
-				: renderTranscriptDelta(delta);
-
+		const sessionId = session.acpSessionId;
+		const warm = continuable && session.acpSessionId === mark.acpSessionId;
+		const unseen = warm ? conversation.filter((entry) => entry.timestamp > mark.timestamp) : conversation;
+		const toSend = forwardable(unseen, conversation);
+		const replayed = !warm && toSend.some((entry) => entry.role === "assistant");
+		const latest = toSend.at(-1);
+		const promptBlocks = !warm
+			? renderTranscriptReplay(toSend)
+			: toSend.length === 1 && latest?.role === "user"
+				? userMessageToPromptBlocks(latest)
+				: renderTranscriptDelta(toSend);
 		if (!promptBlocks || promptBlocks.length === 0) {
-			writer.fail("error", "No prompt content found to send to Antigravity ACP.");
+			writer.fail("error", "No prompt content found to send to Antigravity.");
 			return;
 		}
+		if (replayed) options.notify?.("Agy started a new session and was sent the conversation kept in Pi.");
 
 		let finalPrompt: AcpPromptBlock[] = promptBlocks;
 		try {
-			const defaultPayload = { sessionId, prompt: promptBlocks };
-			const rewritten = (await streamOptions?.onPayload?.(defaultPayload, model)) as
+			const rewritten = (await streamOptions?.onPayload?.({ sessionId, prompt: promptBlocks }, model)) as
 				| { prompt?: AcpPromptBlock[] }
 				| undefined;
 			if (rewritten?.prompt) finalPrompt = rewritten.prompt;
@@ -1032,14 +1042,14 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 			return;
 		}
 
+		message.responseId = `${SESSION_RESPONSE_PREFIX}${sessionId}`;
 		writer.ensureStarted();
 
 		const bridge: ActiveBridge = {
 			sessionId,
 			model,
-			cwd: activeCwd,
-			systemPromptHash: session.systemPromptHash,
 			promptController: new AbortController(),
+			promptGeneration: 0,
 			writer,
 			onRawUpdate,
 			detachSignal: null,
@@ -1052,83 +1062,66 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 			latestUsageUpdate: null,
 			stepCount: 1,
 			aborted: false,
+			finishedTools: new Map(),
+			toolWaiters: new Map(),
 		};
 		activeBridge = bridge;
+		active.setUpdateListener(sessionId, (update, raw) => {
+			bridge.onRawUpdate?.(raw);
+			routeUpdate(bridge, update);
+		});
 		attachSignalToBridge(bridge, signal);
-
-		mcp.setParkHandler(
-			(park) => {
-				if (activeBridge !== bridge || bridge.aborted) return false;
-				bridge.pendingParks.push(park);
-				if (!bridge.parkBatchTimer) {
-					if (parkBatchMs <= 0) {
-						queueMicrotask(() => flushPendingParks(bridge));
-					} else {
-						bridge.parkBatchTimer = setTimeout(() => flushPendingParks(bridge), parkBatchMs);
-						bridge.parkBatchTimer.unref();
-					}
-				}
-				return true;
-			},
-			(cancelledId) => {
-				bridge.awaitingResults.delete(cancelledId);
-			},
-		);
-
 		const phasePromise = awaitBridgePhase(bridge);
-		if (delta === null) log(`main full transcript replay: ${replayReason} sid=${sessionId}`);
-		log(`main prompt sending sid=${sessionId} delta=${delta !== null} blocks=${finalPrompt.length}`);
-
-		void transport
-			.prompt({
-				sessionId,
-				prompt: finalPrompt,
-				signal: bridge.promptController.signal,
-				onRawUpdate: (raw) => bridge.onRawUpdate?.(raw),
-				onUpdate: (update) => routeUpdate(bridge, update),
-			})
-			.then(
-				(result) => {
-					log(`main raw ACP usage sid=${sessionId}: ${JSON.stringify(result.usage ?? null)}`);
-					if (bridge.aborted) return;
-					const resolve = bridge.phaseResolve;
-					bridge.phaseResolve = null;
-					if (resolve) resolve({ kind: "done", result });
-					else bridge.terminalOutcome = { kind: "done", result };
-				},
-				(error: unknown) => {
-					if (bridge.aborted) return;
-					const err = error instanceof Error ? error : new Error(String(error));
-					const resolve = bridge.phaseResolve;
-					bridge.phaseResolve = null;
-					if (resolve) resolve({ kind: "error", error: err });
-					else bridge.terminalOutcome = { kind: "error", error: err };
-				},
-			);
-
+		log(`prompt sid=${sessionId} warm=${warm} blocks=${finalPrompt.length}`);
+		sendPrompt(bridge, finalPrompt, false);
 		const phase = await phasePromise;
-		log(`main phase ended kind=${phase.kind}`);
-		settleMainPhase(bridge, phase, writer, message, context, model);
+		settlePhase(bridge, phase, writer, message, context);
 	}
 
 	const stream = (
-		model: Model<typeof AGY_ACP_API>,
+		model: Model<typeof AGY_API>,
 		context: TranscriptContext,
 		streamOptions?: StreamOptions,
 	): AssistantMessageEventStream => {
 		const events = createAssistantMessageEventStream();
-		const aux = !takeLiveRequest(streamOptions);
-		log(`stream start aux=${aux} model=${model.id} optSid=${streamOptions?.sessionId ?? "none"} activeSid=${activePiSessionId ?? "none"} msgs=${context.messages.length}`);
-		const runner = aux
-			? runAuxiliaryTurn(events, model, context, streamOptions)
-			: runMainTurn(events, model, context, streamOptions);
-		runner.catch((error: unknown) => log(`stream crashed: ${errorMessage(error)}`));
+		const live = takeLiveRequest(streamOptions);
+		log(`stream start live=${live} model=${model.id} msgs=${context.messages.length}`);
+		if (!live) {
+			const writer = createMessageWriter(events, newMessage(model));
+			writer.fail("error", "Agy only answers messages you type in Pi. Use another model for summaries and other side requests.");
+			return events;
+		}
+		runTurn(events, model, context, streamOptions).catch((error: unknown) => log(`stream crashed: ${errorMessage(error)}`));
 		return events;
+	};
+
+	const runApprovedTool = async (toolCallId: string, signal: AbortSignal | undefined): Promise<ApprovedToolResult> => {
+		const bridge = activeBridge;
+		const park = bridge?.awaitingResults.get(toolCallId);
+		if (!bridge || !park || park.answered) {
+			return { text: "Agy is no longer waiting for this tool call.", isError: true };
+		}
+		park.answer({ decision: "auto_approve" });
+		if (park.subagent) return { text: "Approved. Pi cannot see the output of Agy subagent tool calls.", isError: false };
+		const finished = bridge.finishedTools.get(toolCallId);
+		if (finished) return renderToolUpdate(finished);
+		const update = await new Promise<ToolUpdate | undefined>((resolvePromise) => {
+			const waiters = bridge.toolWaiters.get(toolCallId) ?? [];
+			const onAbort = () => resolvePromise(undefined);
+			signal?.addEventListener("abort", onAbort, { once: true });
+			waiters.push((value) => {
+				signal?.removeEventListener("abort", onAbort);
+				resolvePromise(value);
+			});
+			bridge.toolWaiters.set(toolCallId, waiters);
+		});
+		if (signal?.aborted) return { text: "Aborted while Agy ran this tool call.", isError: true };
+		return renderToolUpdate(update);
 	};
 
 	const refreshModels = async (context: RefreshModelsContext): Promise<void> => {
 		const storedModels = (context.stored?.models ?? []).filter(
-			(m): m is Model<typeof AGY_ACP_API> => m.provider === AGY_ACP_PROVIDER_ID && m.api === AGY_ACP_API,
+			(m): m is Model<typeof AGY_API> => m.provider === AGY_PROVIDER_ID && m.api === AGY_API,
 		);
 		if (storedModels.length > 0) {
 			await context.publish({
@@ -1140,10 +1133,11 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 
 		if (!context.allowNetwork || context.signal.aborted || !checkAvailable()) return;
 
-		const transport = acquireAuxTransport();
 		let probeSessionId: string | undefined;
+		let active: AcpTransport | undefined;
 		try {
-			const created = await transport.createSession({ cwd: activeCwd, signal: context.signal });
+			active = await ensureTransport();
+			const created = await active.createSession({ cwd: activeCwd, signal: context.signal });
 			probeSessionId = created.sessionId;
 			const discovered = modelsFromSessionConfig(created.config);
 			if (discovered.length > 0) {
@@ -1157,15 +1151,14 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 		} catch (error) {
 			log(`model discovery failed: ${errorMessage(error)}`);
 		} finally {
-			if (probeSessionId) await transport.closeSession(probeSessionId);
-			releaseAuxTransport(true);
+			if (probeSessionId) await active?.closeSession(probeSessionId);
 		}
 	};
 
-	const provider: Provider<typeof AGY_ACP_API> = {
-		id: AGY_ACP_PROVIDER_ID,
-		name: "Antigravity ACP",
-		baseUrl: `acp://${AGY_ACP_PROVIDER_ID}`,
+	const provider: Provider<typeof AGY_API> = {
+		id: AGY_PROVIDER_ID,
+		name: "Antigravity",
+		baseUrl: `acp://${AGY_PROVIDER_ID}`,
 		auth: {
 			apiKey: {
 				name: "Antigravity CLI (agy acp)",
@@ -1181,58 +1174,24 @@ export function createAgyAcpProvider(options: AgyAcpProviderOptions): AgyAcpProv
 
 	return {
 		provider,
+		gate,
 		syncSession(ctx: SessionSyncContext): void {
 			abandonParkedTurn("Pi switched session or branch.");
 			activePiSessionId = ctx.piSessionId;
 			activeCwd = ctx.cwd;
-			if (ctx.persistedBinding?.configurationVersion !== ACP_CONFIGURATION_VERSION) {
-				ctx = { ...ctx, persistedBinding: undefined };
-			}
-			if (ctx.isFork) {
-				boundSession = null;
-				persistedBinding = undefined;
-				return;
-			}
-			// If we already have a live session matching the persisted binding, keep it;
-			// otherwise clear the in-memory binding and let the next turn resume from `persistedBinding`.
-			if (
-				boundSession &&
-				ctx.persistedBinding &&
-				boundSession.acpSessionId === ctx.persistedBinding.acpSessionId &&
-				boundSession.cwd === ctx.cwd
-			) {
-				persistedBinding = ctx.persistedBinding;
-				return;
-			}
-			boundSession = null;
-			persistedBinding = ctx.persistedBinding;
 		},
 		expectLiveRequest(signal: AbortSignal | undefined): void {
 			pendingLiveSignal = signal;
 		},
-		invalidateSession(reason?: string): void {
-			abandonParkedTurn(reason ? `Session invalidated: ${reason}` : "Session invalidated.");
-			if (boundSession && mainTransport) {
-				void mainTransport.closeSession(boundSession.acpSessionId);
-			}
-			boundSession = null;
-			persistedBinding = undefined;
-		},
+		runApprovedTool,
 		abandonParkedTurn,
 		async dispose(): Promise<void> {
 			abandonParkedTurn("Pi session shutting down.");
-			if (boundSession && mainTransport) {
-				await mainTransport.closeSession(boundSession.acpSessionId);
-			}
+			if (boundSession && transport) await transport.closeSession(boundSession.acpSessionId);
 			boundSession = null;
-			mainTransport?.dispose();
-			mainTransport = null;
-			disposeAuxTransport();
-			if (mcpServer) {
-				await mcpServer.stop();
-				mcpServer = null;
-				mcpStarting = null;
-			}
+			transport?.dispose();
+			transport = null;
+			await gate.stop();
 		},
 	};
 }

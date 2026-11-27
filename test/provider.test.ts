@@ -5,8 +5,8 @@ import {
 	type AssistantMessage,
 	type Message,
 	type StreamOptions,
-	type SystemMessage,
 	type Tool,
+	type ToolResultMessage,
 	type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import type {
@@ -14,32 +14,27 @@ import type {
 	AcpSessionResumeOptions,
 	AcpSessionStartOptions,
 	AcpTransport,
+	AcpUpdateListener,
 } from "../src/acp-client.ts";
-import type { AcpAgentInfo, AcpPromptResult, AcpSessionConfig } from "../src/acp-wire.ts";
-import { fingerprintMessages } from "../src/prompt.ts";
-import { McpBridgeServer, MCP_TOKEN_HEADER } from "../src/mcp-server.ts";
+import type { AcpAgentInfo, AcpPromptResult, AcpSessionConfig, AcpSessionUpdate } from "../src/acp-wire.ts";
+import { GATE_URL_ENV } from "../src/hook-gate.ts";
 import {
-	AGY_ACP_API,
-	AGY_ACP_PROVIDER_ID,
-	ACP_CONFIGURATION_VERSION,
-	createAgyAcpProvider,
+	TYPED_ONLY_REPLY,
+	createAgyNativeProvider,
 	modelsFromSessionConfig,
 	normalizeTurnUsage,
-	type AgyAcpProviderHandle,
-	type PersistedAcpBinding,
+	type AgyNativeProviderHandle,
+	type AgyNativeProviderOptions,
+	type SessionView,
 } from "../src/provider.ts";
 
-function makeContext(systemPrompt: string | SystemMessage, tools: Tool[], messages: Message[]): TranscriptContext {
-	const sys = typeof systemPrompt === "string" ? createInitialSystemMessage(systemPrompt, tools) : systemPrompt;
+// Codemode can hide Pi's read declaration; Agy reads must still go through Pi's read.
+function makeContext(messages: Message[], tools: Tool[] = []): TranscriptContext {
+	const sys = createInitialSystemMessage("Pi prompt", tools);
 	return { messages: sys ? [sys, ...messages] : [...messages] } as TranscriptContext;
 }
 
-const providerStreamObserver: NonNullable<StreamOptions["onProviderStreamEvent"]> = () => {};
-
-function liveRequest(handle: AgyAcpProviderHandle, signal = new AbortController().signal) {
-	handle.expectLiveRequest(signal);
-	return { signal, onProviderStreamEvent: providerStreamObserver };
-}
+const user = (content: string, timestamp: number): Message => ({ role: "user", content, timestamp });
 
 function makeMockConfig(): AcpSessionConfig {
 	return {
@@ -78,52 +73,38 @@ function makeMockConfig(): AcpSessionConfig {
 	};
 }
 
+const USAGE = { inputTokens: 100_000, outputTokens: 20, cachedReadTokens: 0, cachedWriteTokens: 0, thoughtTokens: 0, totalTokens: 100_020 };
+
 class MockAcpTransport implements AcpTransport {
 	readonly createdSessions: AcpSessionStartOptions[] = [];
 	readonly resumedSessions: AcpSessionResumeOptions[] = [];
-	readonly closedSessions: string[] = [];
-	readonly configCalls: Array<{ sessionId: string; configId: string; value: string }> = [];
 	readonly cancelledSessions: string[] = [];
 	readonly prompts: AcpPromptCall[] = [];
-	resumeError?: Error;
-	disposed = false;
+	gateUrl = "";
+	allowPermission: (toolCallId: string | undefined) => boolean = () => false;
 	private seq = 0;
-	private configs = new Map<string, AcpSessionConfig>();
-	promptImpl: (req: AcpPromptCall) => Promise<AcpPromptResult> = async () => ({
-		stopReason: "end_turn",
-		usage: { inputTokens: 100, outputTokens: 20, cachedReadTokens: 0, cachedWriteTokens: 0, thoughtTokens: 0, totalTokens: 120 },
-	});
+	private readonly configs = new Map<string, AcpSessionConfig>();
+	private readonly listeners = new Map<string, AcpUpdateListener>();
+	promptImpl: (req: AcpPromptCall) => Promise<AcpPromptResult> = async () => ({ stopReason: "end_turn", usage: USAGE });
 
 	async ensureReady(): Promise<AcpAgentInfo> {
-		return {
-			protocolVersion: 1,
-			name: "mock-agy-acp",
-			version: "1.5.17",
-			authMethods: [],
-			supportsResume: true,
-			supportsClose: true,
-			supportsSystemPromptAppend: true,
-		};
+		return { protocolVersion: 1, name: "mock", version: "1.5.18", authMethods: [], supportsResume: true, supportsClose: true, supportsSystemPromptAppend: true };
 	}
 
 	async createSession(options: AcpSessionStartOptions) {
 		this.createdSessions.push(options);
-		const sessionId = `acp-sess-${++this.seq}`;
-		const config = makeMockConfig();
-		this.configs.set(sessionId, config);
-		return { sessionId, config };
+		const sessionId = `acp-${++this.seq}`;
+		this.configs.set(sessionId, makeMockConfig());
+		return { sessionId, config: makeMockConfig() };
 	}
 
 	async resumeSession(options: AcpSessionResumeOptions) {
 		this.resumedSessions.push(options);
-		if (this.resumeError) throw this.resumeError;
-		const config = makeMockConfig();
-		this.configs.set(options.sessionId, config);
-		return { sessionId: options.sessionId, config };
+		this.configs.set(options.sessionId, makeMockConfig());
+		return { sessionId: options.sessionId, config: makeMockConfig() };
 	}
 
 	async closeSession(sessionId: string) {
-		this.closedSessions.push(sessionId);
 		this.configs.delete(sessionId);
 	}
 
@@ -132,12 +113,30 @@ class MockAcpTransport implements AcpTransport {
 	}
 
 	async setConfigOption(sessionId: string, configId: string, value: string) {
-		this.configCalls.push({ sessionId, configId, value });
 		const cfg = this.configs.get(sessionId) ?? makeMockConfig();
 		if (configId === "model" && cfg.model) cfg.model = { ...cfg.model, currentValue: value };
 		if (configId === "thought_level" && cfg.thoughtLevel) cfg.thoughtLevel = { ...cfg.thoughtLevel, currentValue: value };
 		this.configs.set(sessionId, cfg);
 		return cfg;
+	}
+
+	setUpdateListener(sessionId: string, listener: AcpUpdateListener | undefined) {
+		if (listener) this.listeners.set(sessionId, listener);
+		else this.listeners.delete(sessionId);
+	}
+
+	emit(sessionId: string, update: AcpSessionUpdate) {
+		this.listeners.get(sessionId)?.(update, { sessionId, update });
+	}
+
+	text(sessionId: string, text: string) {
+		this.emit(sessionId, { type: "agent_message_chunk", text });
+	}
+
+	/** Runs the pi-gate hook the way Agy would, returning Pi's decision. */
+	async hook(toolCall: { id: string; name: string; args: Record<string, unknown> }, conversationId: string) {
+		const response = await fetch(this.gateUrl, { method: "POST", body: JSON.stringify({ toolCall, conversationId }) });
+		return (await response.json()) as { decision: string; reason?: string };
 	}
 
 	async prompt(request: AcpPromptCall): Promise<AcpPromptResult> {
@@ -155,10 +154,55 @@ class MockAcpTransport implements AcpTransport {
 		this.cancelledSessions.push(sessionId);
 	}
 
-	dispose() {
-		this.disposed = true;
-	}
+	dispose() {}
 }
+
+const promptText = (call: AcpPromptCall) => call.prompt.map((block) => (block.type === "text" ? block.text : `[${block.type}]`)).join("\n");
+
+function setup(overrides: Partial<AgyNativeProviderOptions> = {}) {
+	const transport = new MockAcpTransport();
+	const notices: string[] = [];
+	const handle = createAgyNativeProvider({
+		cacheDir: "/tmp/pi-agy-native-unit-test",
+		parkBatchMs: 0,
+		checkAvailable: () => true,
+		installGate: () => {},
+		notify: (message) => notices.push(message),
+		createTransport: (env, allowPermission) => {
+			transport.gateUrl = env[GATE_URL_ENV];
+			transport.allowPermission = allowPermission;
+			return transport;
+		},
+		...overrides,
+	});
+	handle.syncSession({ piSessionId: "pi-1", cwd: "/work" });
+	const model = handle.provider.getModels().find((m) => m.id === "gemini-4-neon")!;
+	const send = (messages: Message[], options: Partial<StreamOptions> = {}) =>
+		handle.provider.streamSimple(model, makeContext(messages), live(handle, options)).result();
+	return { handle, transport, model, send, notices };
+}
+
+function live(handle: AgyNativeProviderHandle, options: Partial<StreamOptions> = {}): StreamOptions {
+	const signal = options.signal ?? new AbortController().signal;
+	handle.expectLiveRequest(signal);
+	return { signal, sessionId: "pi-1", onProviderStreamEvent: () => {}, ...options };
+}
+
+const textOf = (message: AssistantMessage) =>
+	message.content.map((part) => (part.type === "text" ? part.text : "")).join("");
+
+const toolResult = (call: AssistantMessage, text: string, isError: boolean, timestamp: number): ToolResultMessage => {
+	const toolCall = call.content.find((part) => part.type === "toolCall");
+	assert.ok(toolCall && toolCall.type === "toolCall");
+	return { role: "toolResult", toolCallId: toolCall.id, toolName: toolCall.name, content: [{ type: "text", text }], isError, timestamp };
+};
+
+function deferred<T>() {
+	let resolve!: (value: T) => void;
+	const promise = new Promise<T>((r) => (resolve = r));
+	return { promise, resolve };
+}
+
 
 test("modelsFromSessionConfig maps per-model thinking levels and context windows accurately", () => {
 	const models = modelsFromSessionConfig(makeMockConfig());
@@ -194,614 +238,284 @@ test("normalizeTurnUsage scales multi-step cumulative usage to final context occ
 	assert.equal(normalized.totalTokens, 10200);
 });
 
-test("same-session extension call leaves the live ACP turn parked and subsequent turns use only the delta", async () => {
-	const mainTransport = new MockAcpTransport();
-	const auxTransport = new MockAcpTransport();
-	let mcpEndpoint: { url: string; token: string } | undefined;
-	const bindings: PersistedAcpBinding[] = [];
-
-	const handle = createAgyAcpProvider({
-		cacheDir: "/tmp/pi-agy-acp-unit-test",
-		parkBatchMs: 0,
-		checkAvailable: () => true,
-		createMcpServer: () => new McpBridgeServer(),
-		createMainTransport: (ep) => {
-			mcpEndpoint = ep;
-			return mainTransport;
-		},
-		createAuxTransport: () => auxTransport,
-		onBindingChange: (b) => bindings.push(b),
-	});
-
-	const codemodeTool: Tool = {
-		name: "codemode",
-		description: "Run JS in Pi",
-		parameters: { type: "object", properties: { code: { type: "string" } }, required: ["code"] } as never,
+test("a typed message reaches Agy and the next typed message continues the same Agy session", async () => {
+	const { transport, send, handle } = setup();
+	transport.promptImpl = async (req) => {
+		transport.text(req.sessionId, `reply ${transport.prompts.length}`);
+		return { stopReason: "end_turn", usage: USAGE };
 	};
-
-	let mcpToolResponse: unknown;
-	mainTransport.promptImpl = async (req) => {
-		req.onUpdate({ type: "agent_thought_chunk", text: "planning..." });
-		req.onUpdate({ type: "agent_message_chunk", text: "Running tool. " });
-		req.onUpdate({ type: "usage_update", used: 500, size: 1_048_576 });
-
-		// Simulate `agy acp` invoking our localhost MCP server mid-turn
-		const res = await fetch(mcpEndpoint!.url, {
-			method: "POST",
-			headers: { "content-type": "application/json", [MCP_TOKEN_HEADER]: mcpEndpoint!.token },
-			body: JSON.stringify({
-				jsonrpc: "2.0",
-				id: 99,
-				method: "tools/call",
-				params: { name: "codemode", arguments: { code: "return 21 * 2" } },
-			}),
-		});
-		mcpToolResponse = await res.json();
-
-		req.onUpdate({ type: "agent_message_chunk", text: "Done: 42" });
-		req.onUpdate({ type: "usage_update", used: 900, size: 1_048_576 });
-		return {
-			stopReason: "end_turn",
-			usage: { inputTokens: 200, outputTokens: 40, cachedReadTokens: 660, cachedWriteTokens: 0, thoughtTokens: 15, totalTokens: 900 },
-		};
-	};
-
 	try {
-		handle.syncSession({ piSessionId: "pi-1", cwd: "/work" });
-		const model = handle.provider.getModels().find((m) => m.id === "gemini-3.8-flash")!;
-		const user1: Message = { role: "user", content: "compute 21*2", timestamp: 1 };
-		const signal = new AbortController().signal;
-		const liveOptions = { ...liveRequest(handle, signal), sessionId: "pi-1", reasoning: "low" as const };
-		const auxContext = makeContext("Summarize", [], [{ role: "user", content: "summarize this", timestamp: 4 }]);
+		const first = user("hello", 1);
+		const reply1 = await send([first]);
+		assert.equal(reply1.stopReason, "stop");
+		assert.equal(textOf(reply1), "reply 1");
 
-		const beforeLive = handle.provider.streamSimple(model, auxContext, { signal, sessionId: "pi-1" });
-		assert.equal((await beforeLive.result()).stopReason, "stop");
-		assert.equal(mainTransport.createdSessions.length, 0);
-
-		// Phase 1: Pi receives stopReason: "toolUse" + toolCall
-		const stream1 = handle.provider.streamSimple(
-			model,
-			makeContext("Be helpful.", [codemodeTool], [user1]),
-			liveOptions,
-		);
-		const msg1: AssistantMessage = await stream1.result();
-		assert.equal(msg1.stopReason, "toolUse");
-		const toolCall = msg1.content.find((b) => b.type === "toolCall");
-		assert.ok(toolCall && toolCall.type === "toolCall");
-		assert.equal(toolCall.name, "codemode");
-		assert.deepEqual(toolCall.arguments, { code: "return 21 * 2" });
-
-		const auxStream = handle.provider.streamSimple(model, auxContext, { ...liveOptions });
-		assert.equal((await auxStream.result()).stopReason, "stop");
-		assert.deepEqual(mainTransport.cancelledSessions, []);
-		assert.equal(mainTransport.createdSessions.length, 1);
-		assert.equal(auxTransport.createdSessions.length, 2);
-		assert.equal(auxTransport.closedSessions.length, 2);
-		assert.equal(bindings.length, 0);
-
-		// Phase 2: Pi executes tool, appends toolResult + user steering, calls streamSimple again
-		const toolRes: Message = {
-			role: "toolResult",
-			toolCallId: toolCall.id,
-			toolName: "codemode",
-			content: [{ type: "text", text: "42" }],
-			isError: false,
-			timestamp: 2,
-		};
-		const steer: Message = { role: "user", content: "keep it brief", timestamp: 3 };
-
-		const stream2 = handle.provider.streamSimple(
-			model,
-			makeContext("Be helpful. Tools changed.", [codemodeTool], [user1, msg1, toolRes, steer]),
-			{ ...liveRequest(handle, signal), sessionId: "pi-1", reasoning: "low" },
-		);
-		const msg2: AssistantMessage = await stream2.result();
-		assert.equal(msg2.stopReason, "stop");
-		const textBlock = msg2.content.find((b) => b.type === "text");
-		assert.ok(textBlock && textBlock.type === "text");
-		assert.equal(textBlock.text, "Done: 42");
-		assert.equal(msg2.usage.cacheRead, 660);
-		assert.equal(bindings.length, 1);
-
-		// Verify steering was delivered inside the MCP tool result
-		const mcpContent = (mcpToolResponse as { result: { content: Array<{ text: string }> } }).result.content;
-		assert.equal(mcpContent[0].text, "42");
-		assert.match(mcpContent[1].text, /keep it brief/);
-
-		assert.equal(mainTransport.prompts.length, 1);
-		assert.deepEqual(mainTransport.resumedSessions, []);
-		mainTransport.promptImpl = async (req) => {
-			req.onUpdate({ type: "agent_message_chunk", text: "Still warm" });
-			return { stopReason: "end_turn", usage: undefined };
-		};
-		const user2: Message = { role: "user", content: "follow-up", timestamp: 5 };
-		const msg3 = await handle.provider.streamSimple(
-			model,
-			makeContext("Be helpful. Tools changed.", [codemodeTool], [user1, msg1, toolRes, steer, msg2, user2]),
-			{ ...liveRequest(handle), sessionId: "pi-1", reasoning: "low" },
-		).result();
-		assert.equal(msg3.stopReason, "stop");
-		assert.equal(mainTransport.createdSessions.length, 1);
-		assert.equal(mainTransport.prompts[1].sessionId, mainTransport.prompts[0].sessionId);
-		assert.deepEqual(
-			mainTransport.resumedSessions.map(({ sessionId, systemPromptAppend }) => ({ sessionId, systemPromptAppend })),
-			[{ sessionId: mainTransport.prompts[0].sessionId, systemPromptAppend: "Be helpful. Tools changed." }],
-		);
-		assert.deepEqual(mainTransport.prompts[1].prompt, [{ type: "text", text: "follow-up" }]);
-
-		// Simulate Pi restart: a fresh provider instance receives the persisted binding -> resumes via session/resume!
-		const mainTransport2 = new MockAcpTransport();
-		mainTransport2.promptImpl = async (req) => {
-			req.onUpdate({ type: "agent_message_chunk", text: "Resumed ok" });
-			return {
-				stopReason: "end_turn",
-				usage: { inputTokens: 100, outputTokens: 10, cachedReadTokens: 800, cachedWriteTokens: 0, thoughtTokens: 0, totalTokens: 910 },
-			};
-		};
-		const handle2 = createAgyAcpProvider({
-			cacheDir: "/tmp/pi-agy-acp-unit-test",
-			parkBatchMs: 0,
-			checkAvailable: () => true,
-			createMainTransport: () => mainTransport2,
-		});
-		try {
-			const binding = bindings.at(-1)!;
-			handle2.syncSession({ piSessionId: "pi-1", cwd: "/work", persistedBinding: binding });
-			const user3: Message = { role: "user", content: "follow-up after restart", timestamp: 6 };
-			const restarted = await handle2.provider.streamSimple(
-				model,
-				makeContext("Be helpful. Tools changed.", [codemodeTool], [user1, msg1, toolRes, steer, msg2, user2, msg3, user3]),
-				{ ...liveRequest(handle2), sessionId: "pi-1", reasoning: "low" },
-			).result();
-			assert.equal(restarted.stopReason, "stop");
-			assert.equal(mainTransport2.resumedSessions.length, 1);
-			assert.equal(mainTransport2.resumedSessions[0].sessionId, binding.acpSessionId);
-			// Delta prompt only contains the new user message (no <conversation_history> wrapper)
-			assert.deepEqual(mainTransport2.prompts[0].prompt, [{ type: "text", text: "follow-up after restart" }]);
-		} finally {
-			await handle2.dispose();
-		}
-	} finally {
-		await handle.dispose();
-	}
-});
-
-const user = (content: string, timestamp: number): Message => ({ role: "user", content, timestamp });
-
-function mockConversation() {
-	const transport = new MockAcpTransport();
-	const logs: string[] = [];
-	const handle = createAgyAcpProvider({
-		cacheDir: "/tmp/pi-agy-acp-unit-test",
-		createMainTransport: () => transport,
-		log: (message) => logs.push(message),
-	});
-	handle.syncSession({ piSessionId: "pi-live", cwd: "/work" });
-	const model = handle.provider.getModels()[0];
-	const turn = (system: string | SystemMessage, messages: Message[]) => handle.provider.streamSimple(
-		model,
-		makeContext(system, [], messages),
-		{ ...liveRequest(handle), sessionId: "pi-live", reasoning: "low" },
-	).result();
-	return { transport, logs, handle, turn };
-}
-
-test("legacy bindings replay with the new agent instead of resuming its old prompt configuration", async () => {
-	const { transport, handle, turn } = mockConversation();
-	try {
-		const prior = user("old task", 1);
-		handle.syncSession({ piSessionId: "pi-live", cwd: "/work", persistedBinding: {
-			piSessionId: "pi-live", acpSessionId: "old-agent", cwd: "/work", modelId: "gemini-4-neon",
-			syncedFingerprint: fingerprintMessages([prior]), systemPromptHash: "old",
-		} });
-		await turn("Project rules.", [prior, user("new task", 2)]);
-		assert.equal(transport.resumedSessions.length, 0);
+		const reply2 = await send([first, reply1, user("and again", reply1.timestamp + 1)]);
+		assert.equal(textOf(reply2), "reply 2");
 		assert.equal(transport.createdSessions.length, 1);
-		assert.match(JSON.stringify(transport.prompts[0].prompt), /old task/);
-	} finally { await handle.dispose(); }
-});
-
-test("a flattened stock prompt ends the stream with a local error before starting ACP", async () => {
-	const { transport, handle, turn } = mockConversation();
-	try {
-		const result = await turn("You are a coding assistant running inside pi, a coding agent harness.\n\n<docs>Pi documentation</docs>", [user("hello", 1)]);
-		assert.equal(result.stopReason, "error");
-		assert.match(result.errorMessage!, /Flattened stock Pi/);
-		assert.equal(transport.createdSessions.length, 0);
-	} finally { await handle.dispose(); }
-});
-
-for (const auxiliary of [false, true]) {
-	test(`terminal ACP warning fails ${auxiliary ? "auxiliary" : "main"} turn without publishing a successful binding`, async () => {
-		const transport = new MockAcpTransport();
-		const bindings: PersistedAcpBinding[] = [];
-		const handle = createAgyAcpProvider({ cacheDir: "/tmp/pi-agy-acp-unit-test", createMainTransport: () => transport,
-			createAuxTransport: () => transport, onBindingChange: (binding) => bindings.push(binding) });
-		handle.syncSession({ piSessionId: "pi-live", cwd: "/work" });
-		const warning = "⚠ RESOURCE_EXHAUSTED (code 429): Resource has been exhausted (e.g. check quota).";
-		transport.promptImpl = async (request) => {
-			request.onUpdate({ type: "agent_message_chunk", text: warning.slice(0, 15) });
-			request.onUpdate({ type: "agent_message_chunk", text: warning.slice(15) });
-			return { stopReason: "end_turn", usage: { inputTokens: 0, outputTokens: 0, thoughtTokens: 0, cachedReadTokens: 0, cachedWriteTokens: 0, totalTokens: 0 } };
-		};
-		try {
-			const model = handle.provider.getModels()[0];
-			const result = await handle.provider.streamSimple(model, makeContext("Project rules.", [], [user("hello", 1)]), auxiliary ? {} : { ...liveRequest(handle), sessionId: "pi-live" }).result();
-			assert.equal(result.stopReason, "error");
-			assert.equal(result.errorMessage, warning);
-			assert.equal(bindings.length, 0);
-			transport.promptImpl = async (request) => {
-				request.onUpdate({ type: "agent_message_chunk", text: "Recovered" });
-				return { stopReason: "end_turn", usage: undefined };
-			};
-			if (!auxiliary) {
-				await handle.provider.streamSimple(model, makeContext("Project rules.", [], [user("retry", 2)]), { ...liveRequest(handle), sessionId: "pi-live" }).result();
-				assert.equal(bindings[0].configurationVersion, ACP_CONFIGURATION_VERSION);
-			}
-		} finally { await handle.dispose(); }
-	});
-}
-
-const stockSystem = (tools: string, rules: string): SystemMessage => ({
-	role: "system",
-	content: "",
-	sections: {
-		preamble: "You are a coding assistant running inside pi, a coding agent harness.",
-		tools,
-		rules,
-		project_context: "<project_context>AGENTS.md</project_context>",
-	},
-	timestamp: 0,
-});
-
-test("a Pi tools-only system patch keeps the ACP session warm and sends a delta without resume", async (t) => {
-	const { transport, handle, turn } = mockConversation();
-	t.after(() => handle.dispose());
-	const system = stockSystem("<tools>codemode</tools>", "<rules>Be concise.</rules>");
-	const first = user("first question", 1);
-	const reply = await turn(system, [first]);
-	const toolPatch: SystemMessage = {
-		role: "system",
-		content: "",
-		sections: { tools: "<tools>codemode, fetch_content</tools>" },
-		timestamp: 2,
-	};
-	const next = await turn(system, [first, reply, toolPatch, user("next question", 3)]);
-	assert.equal(next.stopReason, "stop");
-	assert.doesNotMatch(transport.createdSessions[0].systemPromptAppend ?? "", /<tools>/);
-	assert.equal(transport.createdSessions.length, 1);
-	assert.equal(transport.prompts[1].sessionId, transport.prompts[0].sessionId);
-	assert.deepEqual(transport.prompts[1].prompt, [{ type: "text", text: "next question" }]);
-	assert.deepEqual(transport.resumedSessions, []);
-});
-
-test("a rules change resumes with the full append, then tools-only changes keep that session warm", async (t) => {
-	const { transport, handle, turn } = mockConversation();
-	t.after(() => handle.dispose());
-	const first = user("first question", 1);
-	const reply = await turn(stockSystem("<tools>codemode</tools>", "<rules>Be concise.</rules>"), [first]);
-	const second = user("next question", 2);
-	const next = await turn(stockSystem("<tools>codemode, fetch_content</tools>", "<rules>Give examples.</rules>"), [first, reply, second]);
-	assert.equal(next.stopReason, "stop");
-	const sid = transport.prompts[0].sessionId;
-	assert.deepEqual(
-		transport.resumedSessions.map(({ sessionId, systemPromptAppend }) => ({ sessionId, systemPromptAppend })),
-		[{
-			sessionId: sid,
-			systemPromptAppend: "<rules>Give examples.</rules>\n\n<project_context>AGENTS.md</project_context>",
-		}],
-	);
-	const third = await turn(stockSystem("<tools>codemode</tools>", "<rules>Give examples.</rules>"), [
-		first, reply, second, next, user("third question", 3),
-	]);
-	assert.equal(third.stopReason, "stop");
-	assert.equal(transport.createdSessions.length, 1);
-	assert.equal(transport.prompts[2].sessionId, sid);
-	assert.deepEqual(transport.prompts[2].prompt, [{ type: "text", text: "third question" }]);
-	assert.equal(transport.resumedSessions.length, 1);
-});
-
-test("changed system append resumes the same ACP session with only the next user prompt", async (t) => {
-	const { transport, handle, turn } = mockConversation();
-	t.after(() => handle.dispose());
-	const first = user("first question", 1);
-	const reply = await turn("original system", [first]);
-	transport.configCalls.length = 0;
-	const followUp = user("next question", 2);
-	const next = await turn("updated system", [first, reply, followUp]);
-	assert.equal(next.stopReason, "stop");
-
-	assert.equal(transport.createdSessions.length, 1);
-	assert.deepEqual(transport.closedSessions, []);
-	const sessionId = transport.prompts[0].sessionId;
-	assert.deepEqual(
-		transport.resumedSessions.map(({ sessionId, systemPromptAppend }) => ({ sessionId, systemPromptAppend })),
-		[{ sessionId, systemPromptAppend: "updated system" }],
-	);
-	assert.equal(transport.prompts[1].sessionId, sessionId);
-	assert.deepEqual(transport.prompts[1].prompt, [{ type: "text", text: "next question" }]);
-	assert.deepEqual(
-		Object.fromEntries(transport.configCalls.filter((call) => call.sessionId === sessionId).map((call) => [call.configId, call.value])),
-		{ model: "gemini-4-neon", thought_level: "low" },
-	);
-
-	const third = await turn("updated system", [first, reply, followUp, next, user("third question", 3)]);
-	assert.equal(third.stopReason, "stop");
-	assert.equal(transport.resumedSessions.length, 1);
-	assert.deepEqual(transport.prompts[2].prompt, [{ type: "text", text: "third question" }]);
-});
-
-test("failed append refresh keeps the warm ACP session and retries the update on the next turn", async (t) => {
-	const { transport, logs, handle, turn } = mockConversation();
-	t.after(() => handle.dispose());
-	const first = user("first question", 1);
-	const reply = await turn("original system", [first]);
-	const second = user("next question", 2);
-	transport.resumeError = new Error("resume not available");
-	const next = await turn("updated system", [first, reply, second]);
-	assert.equal(next.stopReason, "stop");
-
-	const sessionId = transport.prompts[0].sessionId;
-	assert.equal(transport.createdSessions.length, 1);
-	assert.deepEqual(transport.closedSessions, []);
-	assert.equal(transport.prompts[1].sessionId, sessionId);
-	assert.deepEqual(transport.prompts[1].prompt, [{ type: "text", text: "next question" }]);
-	assert.match(logs.join("\n"), /keeping previous system append: resume not available/);
-
-	transport.resumeError = undefined;
-	const third = await turn("updated system", [first, reply, second, next, user("third question", 3)]);
-	assert.equal(third.stopReason, "stop");
-	assert.deepEqual(
-		transport.resumedSessions.map(({ sessionId, systemPromptAppend }) => ({ sessionId, systemPromptAppend })),
-		[{ sessionId, systemPromptAppend: "updated system" }, { sessionId, systemPromptAppend: "updated system" }],
-	);
-});
-
-test("a converted Pi custom message between turns is sent as context delta, not replayed history", async (t) => {
-	const { transport, handle, turn } = mockConversation();
-	t.after(() => handle.dispose());
-	const first = user("old question", 1);
-	const reply = await turn("sys", [first]);
-	const notice = user("background task completed", 2);
-	const next = await turn("sys", [first, reply, notice, user("next question", 3)]);
-	assert.equal(next.stopReason, "stop");
-
-	assert.equal(transport.createdSessions.length, 1);
-	assert.equal(transport.prompts[1].sessionId, transport.prompts[0].sessionId);
-	const [context, question] = transport.prompts[1].prompt;
-	assert.equal(context.type, "text");
-	assert.match(context.text, /background task completed/);
-	assert.doesNotMatch(context.text, /old question|conversation_history/);
-	assert.deepEqual(question, { type: "text", text: "next question" });
-});
-
-test("a context-only Pi continuation stays warm without replaying history", async (t) => {
-	const { transport, handle, turn } = mockConversation();
-	t.after(() => handle.dispose());
-	const first = user("first question", 1);
-	const reply = await turn("sys", [first]);
-	const next = await turn("sys", [first, reply]);
-	assert.equal(next.stopReason, "stop");
-	assert.equal(transport.createdSessions.length, 1);
-	assert.equal(transport.prompts[1].sessionId, transport.prompts[0].sessionId);
-	assert.deepEqual(transport.prompts[1].prompt, [{ type: "text", text: "Continue the conversation." }]);
-});
-
-test("an edited prefix starts a new ACP session, replays the edited history, and logs why", async (t) => {
-	const { transport, logs, handle, turn } = mockConversation();
-	t.after(() => handle.dispose());
-	const reply = await turn("sys", [user("original question", 1)]);
-	const next = await turn("sys", [user("edited question", 1), reply, user("next question", 2)]);
-	assert.equal(next.stopReason, "stop");
-
-	assert.equal(transport.createdSessions.length, 2);
-	assert.notEqual(transport.prompts[1].sessionId, transport.prompts[0].sessionId);
-	const [history, question] = transport.prompts[1].prompt;
-	assert.equal(history.type, "text");
-	assert.match(history.text, /<conversation_history>[\s\S]*edited question/);
-	assert.doesNotMatch(history.text, /original question/);
-	assert.deepEqual(question, { type: "text", text: "next question" });
-	assert.match(logs.join("\n"), /full transcript replay: diverged prefix/);
-	assert.match(logs.join("\n"), /raw ACP usage[^\n]*"inputTokens":100/);
-});
-
-test("refreshModels restores stored catalog offline and persists discovered models online", async () => {
-	const auxTransport = new MockAcpTransport();
-	const handle = createAgyAcpProvider({
-		cacheDir: "/tmp/pi-agy-acp-unit-test-2",
-		checkAvailable: () => true,
-		createAuxTransport: () => auxTransport,
-	});
-
-	try {
-		const storedModel = {
-			id: "gemini-4-neon",
-			name: "Stored Neon",
-			api: AGY_ACP_API,
-			provider: AGY_ACP_PROVIDER_ID,
-			baseUrl: "acp://agy-acp",
-			reasoning: true,
-			input: ["text", "image"] as ("text" | "image")[],
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-			contextWindow: 1_048_576,
-			maxTokens: 65_536,
-		};
-
-		// Offline startup restore
-		await handle.provider.refreshModels!({
-			stored: { models: [storedModel], checkedAt: 1000 },
-			allowNetwork: false,
-			signal: new AbortController().signal,
-			publish: async (pub) => {
-				pub.update?.();
-				return true;
-			},
-		});
-		assert.equal(handle.provider.getModels().length, 1);
-		assert.equal(handle.provider.getModels()[0].name, "Stored Neon");
-
-		// Online discovery persists full catalog
-		let persistedCount = 0;
-		await handle.provider.refreshModels!({
-			stored: { models: [storedModel], checkedAt: 1000 },
-			allowNetwork: true,
-			signal: new AbortController().signal,
-			publish: async (pub) => {
-				if (pub.persist) persistedCount = pub.persist.models.length;
-				pub.update?.();
-				return true;
-			},
-		});
-		assert.equal(persistedCount, 4);
-		assert.equal(handle.provider.getModels().length, 4);
-		assert.equal(auxTransport.closedSessions.length, 1);
-		assert.equal(auxTransport.disposed, true);
+		assert.deepEqual(transport.prompts.map((p) => p.sessionId), ["acp-1", "acp-1"]);
+		assert.deepEqual(transport.prompts.map(promptText), ["hello", "and again"]);
 	} finally {
 		await handle.dispose();
 	}
 });
 
-test("abandonParkedTurn cancels remote ACP session and rejects open MCP call", async () => {
-	const mainTransport = new MockAcpTransport();
-	let mcpEndpoint: { url: string; token: string } | undefined;
-	const handle = createAgyAcpProvider({
-		cacheDir: "/tmp/pi-agy-acp-unit-test-3",
-		parkBatchMs: 0,
-		checkAvailable: () => true,
-		createMcpServer: () => new McpBridgeServer(),
-		createMainTransport: (ep) => {
-			mcpEndpoint = ep;
-			return mainTransport;
-		},
-	});
+test("Pi's context meter counts Pi's transcript, not Agy's own context", async () => {
+	const { send, handle } = setup();
+	try {
+		const reply = await send([user("hello", 1)]);
+		assert.ok(reply.usage.input === USAGE.inputTokens);
+		assert.ok(reply.usage.totalTokens > 0 && reply.usage.totalTokens < 1_000, `totalTokens ${reply.usage.totalTokens}`);
+	} finally {
+		await handle.dispose();
+	}
+});
 
-	const codemodeTool: Tool = {
-		name: "codemode",
-		description: "Run JS",
-		parameters: { type: "object", properties: {} } as never,
+test("an allowed Agy command runs and its output becomes the Pi tool result", async () => {
+	const { transport, send, handle } = setup();
+	const decisions: unknown[] = [];
+	transport.promptImpl = async (req) => {
+		transport.text(req.sessionId, "Running. ");
+		decisions.push(await transport.hook({ id: "tc-1", name: "run_command", args: { CommandLine: "echo hi", Cwd: "/work" } }, req.sessionId));
+		transport.emit(req.sessionId, { type: "tool_call_update", toolCallId: "tc-1", title: "echo hi", status: "completed", rawOutput: { output: "hi\n", exit_code: 0 }, content: undefined });
+		transport.text(req.sessionId, "Printed hi.");
+		return { stopReason: "end_turn", usage: USAGE };
 	};
+	try {
+		const first = user("say hi in the shell", 1);
+		const parked = await send([first]);
+		assert.equal(parked.stopReason, "toolUse");
+		const call = parked.content.find((part) => part.type === "toolCall");
+		assert.ok(call && call.type === "toolCall");
+		assert.equal(call.name, "agy_command");
+		assert.deepEqual(call.arguments, { command: "echo hi", cwd: "/work" });
 
-	let mcpErrorResult: unknown;
-	mainTransport.promptImpl = async () => {
-		const res = await fetch(mcpEndpoint!.url, {
-			method: "POST",
-			headers: { "content-type": "application/json", [MCP_TOKEN_HEADER]: mcpEndpoint!.token },
-			body: JSON.stringify({
-				jsonrpc: "2.0",
-				id: 55,
-				method: "tools/call",
-				params: { name: "codemode", arguments: {} },
-			}),
-		});
-		mcpErrorResult = await res.json();
+		const output = await handle.runApprovedTool(call.id, undefined);
+		assert.deepEqual(output, { text: "hi\n", isError: false });
+		assert.deepEqual(decisions, [{ decision: "auto_approve" }]);
+		assert.equal(transport.allowPermission("tc-1"), true);
+		assert.equal(transport.allowPermission("tc-other"), false);
+
+		const done = await send([first, parked, toolResult(parked, "hi\n", false, 3)]);
+		assert.equal(done.stopReason, "stop");
+		assert.equal(textOf(done), "Printed hi.");
+		assert.equal(transport.prompts.length, 1);
+	} finally {
+		await handle.dispose();
+	}
+});
+
+test("a call Pi blocks is denied to Agy with Pi's reason", async () => {
+	const { transport, send, handle } = setup();
+	const decisions: unknown[] = [];
+	transport.promptImpl = async (req) => {
+		decisions.push(await transport.hook({ id: "tc-1", name: "run_command", args: { CommandLine: "printenv MY_KEY" } }, req.sessionId));
+		transport.text(req.sessionId, "Blocked.");
+		return { stopReason: "end_turn", usage: USAGE };
+	};
+	try {
+		const first = user("print the key", 1);
+		const parked = await send([first]);
+		const done = await send([first, parked, toolResult(parked, "Blocked by rule: secrets", true, 3)]);
+		assert.equal(textOf(done), "Blocked.");
+		assert.deepEqual(decisions, [{ decision: "deny", reason: "Blocked by rule: secrets" }]);
+	} finally {
+		await handle.dispose();
+	}
+});
+
+test("Agy reads become Pi read calls, and Agy reads the file once Pi allows it", async () => {
+	const { transport, send, handle } = setup();
+	const decisions: unknown[] = [];
+	transport.promptImpl = async (req) => {
+		decisions.push(await transport.hook({ id: "tc-1", name: "read_file", args: { Path: "/work/notes.txt" } }, req.sessionId));
+		return { stopReason: "end_turn", usage: USAGE };
+	};
+	try {
+		const first = user("read notes", 1);
+		const parked = await send([first]);
+		const call = parked.content.find((part) => part.type === "toolCall");
+		assert.ok(call && call.type === "toolCall");
+		assert.equal(call.name, "read");
+		assert.deepEqual(call.arguments, { path: "/work/notes.txt" });
+		await send([first, parked, toolResult(parked, "file text", false, 3)]);
+		assert.deepEqual(decisions, [{ decision: "auto_approve" }]);
+	} finally {
+		await handle.dispose();
+	}
+});
+
+test("Agy writes and other calls on a file carry the path Pi's path rules check", async () => {
+	const { transport, send, handle } = setup();
+	transport.promptImpl = async (req) => {
+		await transport.hook({ id: "tc-1", name: "write_file", args: { Path: "/work/a.txt", Content: "hi" } }, req.sessionId);
+		await transport.hook({ id: "tc-2", name: "list_dir", args: { AbsolutePath: "/home/me/.ssh" } }, req.sessionId);
+		return { stopReason: "end_turn", usage: USAGE };
+	};
+	try {
+		const first = user("write", 1);
+		const parked = await send([first]);
+		const write = parked.content.find((part) => part.type === "toolCall");
+		assert.ok(write && write.type === "toolCall");
+		assert.equal(write.name, "agy_edit");
+		assert.deepEqual(write.arguments, { path: "/work/a.txt" });
+		const parked2 = await send([first, parked, toolResult(parked, "ok", false, 3)]);
+		const list = parked2.content.find((part) => part.type === "toolCall");
+		assert.ok(list && list.type === "toolCall");
+		assert.deepEqual(list.arguments, { tool: "list_dir", arguments: { AbsolutePath: "/home/me/.ssh" }, path: "/home/me/.ssh" });
+	} finally {
+		await handle.dispose();
+	}
+});
+
+test("subagent and unknown tool calls are shown as such and return without output", async () => {
+	const { transport, send, handle } = setup();
+	transport.promptImpl = async () => {
+		await transport.hook({ id: "tc-1", name: "search_web", args: { query: "pi" } }, "subagent-conversation");
+		return { stopReason: "end_turn", usage: USAGE };
+	};
+	try {
+		const parked = await send([user("research", 1)]);
+		const call = parked.content.find((part) => part.type === "toolCall");
+		assert.ok(call && call.type === "toolCall");
+		assert.equal(call.name, "agy_tool");
+		assert.deepEqual(call.arguments, { tool: "search_web", arguments: { query: "pi" }, subagent: true });
+		const output = await handle.runApprovedTool(call.id, undefined);
+		assert.equal(output.isError, false);
+		assert.match(output.text, /subagent/);
+	} finally {
+		await handle.dispose();
+	}
+});
+
+test("a hook call with no Pi turn running is denied", async () => {
+	const { transport, send, handle } = setup();
+	try {
+		await send([user("hello", 1)]);
+		const decision = await transport.hook({ id: "late", name: "run_command", args: { CommandLine: "ls" } }, "acp-1");
+		assert.equal(decision.decision, "deny");
+	} finally {
+		await handle.dispose();
+	}
+});
+
+test("runs nobody typed and side requests get an answer without contacting Agy", async () => {
+	const { transport, send, handle, model } = setup();
+	try {
+		const first = user("hello", 1);
+		const reply = await send([first]);
+		const continuation = await send([first, reply]);
+		assert.equal(continuation.stopReason, "stop");
+		assert.equal(textOf(continuation), TYPED_ONLY_REPLY);
+
+		const side = await handle.provider.streamSimple(model, makeContext([user("summarize", 5)]), { signal: new AbortController().signal }).result();
+		assert.equal(side.stopReason, "error");
+		assert.equal(transport.prompts.length, 1);
+
+		const next = await send([first, reply, continuation, user("next", continuation.timestamp + 1)]);
+		assert.equal(next.stopReason, "stop");
+		assert.equal(promptText(transport.prompts[1]), "next");
+	} finally {
+		await handle.dispose();
+	}
+});
+
+test("turns another model answered since Agy's last reply are sent as context", async () => {
+	const { transport, send, handle } = setup();
+	try {
+		const first = user("hello", 1);
+		const reply = await send([first]);
+		const other: AssistantMessage = { ...reply, provider: "anthropic", model: "claude", responseId: undefined, content: [{ type: "text", text: "Claude answered" }], timestamp: reply.timestamp + 2 };
+		await send([first, reply, user("question for claude", reply.timestamp + 1), other, user("back to agy", reply.timestamp + 3)]);
+		assert.equal(transport.createdSessions.length, 1);
+		const sent = promptText(transport.prompts[1]);
+		assert.match(sent, /<conversation_context>[\s\S]*question for claude[\s\S]*Claude answered[\s\S]*<\/conversation_context>\nback to agy$/);
+		assert.doesNotMatch(sent, /hello/);
+	} finally {
+		await handle.dispose();
+	}
+});
+
+test("a branch that dropped Agy's last reply starts a fresh Agy session with the kept conversation", async () => {
+	let view: SessionView | undefined;
+	const { transport, send, handle, notices } = setup({ getSessionView: () => view });
+	try {
+		const first = user("hello", 1);
+		const reply = await send([first]);
+		const mark = { acpSessionId: "acp-1", timestamp: reply.timestamp };
+		view = { branchMark: mark, latestTimestamp: () => reply.timestamp + 100, retired: new Set() };
+		await send([first, reply, user("different path", reply.timestamp + 1)]);
+		assert.equal(transport.createdSessions.length, 2);
+		assert.equal(transport.prompts[1].sessionId, "acp-2");
+		assert.match(promptText(transport.prompts[1]), /<conversation_history>[\s\S]*hello[\s\S]*<\/conversation_history>\ndifferent path$/);
+		assert.equal(notices.length, 1);
+
+		view = { branchMark: mark, latestTimestamp: () => reply.timestamp, retired: new Set(["acp-1"]) };
+		await send([first, reply, user("forked", reply.timestamp + 1)]);
+		assert.equal(transport.createdSessions.length, 3);
+	} finally {
+		await handle.dispose();
+	}
+});
+
+test("an Agy session from an earlier Pi process is resumed, not replayed", async () => {
+	const { transport, send, handle } = setup({
+		getSessionView: () => ({ branchMark: { acpSessionId: "old-acp", timestamp: 10 }, latestTimestamp: () => 10, retired: new Set() }),
+	});
+	try {
+		const earlier: AssistantMessage = { role: "assistant", content: [{ type: "text", text: "old" }], api: "agy-native", provider: "agy-native", model: "gemini-4-neon", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, stopReason: "stop", timestamp: 10 };
+		await send([user("hello", 1), earlier, user("still there?", 11)]);
+		assert.deepEqual(transport.resumedSessions.map((s) => s.sessionId), ["old-acp"]);
+		assert.equal(transport.createdSessions.length, 0);
+		assert.equal(promptText(transport.prompts[0]), "still there?");
+	} finally {
+		await handle.dispose();
+	}
+});
+
+test("Esc cancels the Agy turn and denies the parked tool call", async () => {
+	const { transport, send, handle } = setup();
+	const decision = deferred<unknown>();
+	transport.promptImpl = async (req) => {
+		decision.resolve(await transport.hook({ id: "tc-1", name: "run_command", args: { CommandLine: "sleep 60" } }, req.sessionId));
 		return { stopReason: "cancelled", usage: undefined };
 	};
-
 	try {
-		handle.syncSession({ piSessionId: "pi-2", cwd: "/work" });
-		const model = handle.provider.getModels()[0];
-		const stream1 = handle.provider.streamSimple(
-			model,
-			makeContext("sys", [codemodeTool], [{ role: "user", content: "go", timestamp: 1 }]),
-			{ ...liveRequest(handle), sessionId: "pi-2" },
-		);
-		const msg1 = await stream1.result();
-		assert.equal(msg1.stopReason, "toolUse");
-
-		// Simulate Pi aborting during tool execution (agent_end fires without follow-up streamSimple)
-		handle.abandonParkedTurn("User aborted");
-		await new Promise((r) => setTimeout(r, 30));
-
-		assert.equal(mainTransport.cancelledSessions.length, 1);
-		assert.equal((mcpErrorResult as { result: { isError: boolean } }).result.isError, true);
+		const controller = new AbortController();
+		const first = user("wait", 1);
+		const parked = await send([first], { signal: controller.signal });
+		assert.equal(parked.stopReason, "toolUse");
+		controller.abort();
+		const resumed = await send([first, parked, toolResult(parked, "aborted", true, 3)], { signal: controller.signal });
+		assert.equal(resumed.stopReason, "aborted");
+		assert.equal((await decision.promise as { decision: string }).decision, "deny");
+		assert.deepEqual(transport.cancelledSessions, ["acp-1"]);
 	} finally {
 		await handle.dispose();
 	}
 });
 
-test("aborting a main turn aborts the underlying ACP prompt signal so a follow-up turn runs cleanly", async (t) => {
-	const mainTransport = new MockAcpTransport();
-	const handle = createAgyAcpProvider({
-		cacheDir: "/tmp/pi-agy-acp-unit-test-4",
-		checkAvailable: () => true,
-		createMainTransport: () => mainTransport,
-	});
-	t.after(() => handle.dispose());
-	handle.syncSession({ piSessionId: "pi-abort", cwd: "/work" });
-	const model = handle.provider.getModels()[0];
-
-	let firstSignalAborted = false;
-	mainTransport.promptImpl = (req) =>
-		new Promise((resolve) => {
-			if (mainTransport.prompts.length === 1) {
-				req.signal?.addEventListener(
-					"abort",
-					() => {
-						firstSignalAborted = true;
-						resolve({ stopReason: "cancelled", usage: undefined });
-					},
-					{ once: true },
-				);
-			} else {
-				req.onUpdate({ type: "agent_message_chunk", text: "Recovered" });
-				resolve({ stopReason: "end_turn", usage: undefined });
-			}
-		});
-
-	const ac = new AbortController();
-	const firstStream = handle.provider.streamSimple(
-		model,
-		makeContext("sys", [], [user("slow task", 1)]),
-		{ ...liveRequest(handle, ac.signal), sessionId: "pi-abort" },
-	);
-	await new Promise((r) => setTimeout(r, 20));
-	ac.abort();
-	const abortedMsg = await firstStream.result();
-	assert.equal(abortedMsg.stopReason, "aborted");
-	assert.equal(firstSignalAborted, true);
-	assert.equal(mainTransport.cancelledSessions.length, 1);
-
-	const nextMsg = await handle.provider.streamSimple(
-		model,
-		makeContext("sys", [], [user("try again", 2)]),
-		{ ...liveRequest(handle), sessionId: "pi-abort" },
-	).result();
-	assert.equal(nextMsg.stopReason, "stop");
-	assert.equal(mainTransport.prompts.length, 2);
-});
-
-test("auxTransport is disposed after auxIdleMs of inactivity", async (t) => {
-	const created: MockAcpTransport[] = [];
-	const handle = createAgyAcpProvider({
-		cacheDir: "/tmp/pi-agy-acp-unit-test-5",
-		auxIdleMs: 25,
-		checkAvailable: () => true,
-		createAuxTransport: () => {
-			const transport = new MockAcpTransport();
-			created.push(transport);
-			return transport;
-		},
-	});
-	t.after(() => handle.dispose());
-	const model = handle.provider.getModels()[0];
-
-	const msg1 = await handle.provider.streamSimple(
-		model,
-		makeContext("Summarize", [], [user("text 1", 1)]),
-		{},
-	).result();
-	assert.equal(msg1.stopReason, "stop");
-	assert.equal(created.length, 1);
-	assert.equal(created[0].disposed, false);
-
-	await new Promise((r) => setTimeout(r, 60));
-	assert.equal(created[0].disposed, true);
-
-	const msg2 = await handle.provider.streamSimple(
-		model,
-		makeContext("Summarize", [], [user("text 2", 2)]),
-		{},
-	).result();
-	assert.equal(msg2.stopReason, "stop");
-	assert.equal(created.length, 2);
+test("a message typed during tool execution is sent to Agy as a steering prompt", async () => {
+	const { transport, send, handle } = setup();
+	const steered = deferred<void>();
+	transport.promptImpl = async (req) => {
+		if (req.steer) {
+			transport.text(req.sessionId, "Switched.");
+			steered.resolve();
+			return { stopReason: "end_turn", usage: USAGE };
+		}
+		await transport.hook({ id: "tc-1", name: "run_command", args: { CommandLine: "ls" } }, req.sessionId);
+		await steered.promise;
+		return { stopReason: "end_turn", usage: USAGE };
+	};
+	try {
+		const first = user("list files", 1);
+		const parked = await send([first]);
+		const done = await send([first, parked, toolResult(parked, "denied", true, 3), user("do something else", 4)]);
+		assert.equal(textOf(done), "Switched.");
+		assert.equal(transport.prompts.at(-1)?.steer, true);
+		assert.equal(promptText(transport.prompts.at(-1)!), "do something else");
+	} finally {
+		await handle.dispose();
+	}
 });

@@ -1,22 +1,11 @@
 /**
- * JSON-RPC 2.0 client managing an `agy acp` subprocess with an isolated
- * per-process `--gemini-dir` (sharing the SQLite conversation store across
- * restarts while isolating per-process `mcp_config.json` and `agent.md`).
+ * JSON-RPC 2.0 client for a stock `agy acp` subprocess. Agy runs with the
+ * user's own configuration; the environment carries the Pi gate address.
  */
 
 import { spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from "node:child_process";
-import {
-	accessSync,
-	constants as fsConstants,
-	existsSync,
-	mkdirSync,
-	readdirSync,
-	rmSync,
-	statSync,
-	symlinkSync,
-	writeFileSync,
-} from "node:fs";
-import { delimiter, join, resolve } from "node:path";
+import { accessSync, constants as fsConstants } from "node:fs";
+import { delimiter, join } from "node:path";
 import { createInterface } from "node:readline";
 import {
 	ACP_PROTOCOL_VERSION,
@@ -25,56 +14,31 @@ import {
 	parseConfigOptionUpdate,
 	parseInitializeResult,
 	parseNewSessionResult,
+	parsePermissionRequest,
 	parsePromptResult,
 	parseRpcMessage,
 	parseSessionConfig,
 	parseSessionUpdate,
-	piToolPermission,
+	permissionOutcome,
 	type AcpAgentInfo,
+	type AcpPermissionRequest,
 	type AcpPromptBlock,
 	type AcpPromptResult,
 	type AcpSessionConfig,
 	type AcpSessionUpdate,
 	type RpcId,
 } from "./acp-wire.ts";
-import { MCP_SERVER_NAME, MCP_TOKEN_HEADER } from "./mcp-server.ts";
 
-const AGENT_NAME = "pi-host";
-const APP_DATA_DIR_NAME = "antigravity-cli";
-const CLIENT_NAME = "pi-agy-acp";
-const CLIENT_VERSION = "0.1.0";
+export const CLIENT_NAME = "pi-agy-acp";
+export const CLIENT_VERSION = "0.2.0";
 const KILL_GRACE_MS = 3_000;
 const CANCEL_GRACE_MS = 3_000;
 const DEFAULT_HANDSHAKE_TIMEOUT_MS = 30_000;
-const CONVERSATION_TTL_MS = 14 * 24 * 60 * 60 * 1000;
-const LOG_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-const TMP_FILE_TTL_MS = 60 * 60 * 1000;
 const PARENT_SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
 const IS_WINDOWS = process.platform === "win32";
 
-const PI_HOST_AGENT_MD = `---
-name: ${AGENT_NAME}
-description: Host bridge using Agy default guidance and Pi MCP tools.
-mainAgent: true
-subagent: false
-excludeDefaultComponents: false
-inheritCustomizations: false
-inheritMcp: true
-tools: []
-rules: []
-skills: []
-agents: []
----
-`;
-
-export interface AcpMcpEndpoint {
-	url: string;
-	token: string;
-}
-
 export interface AcpSessionStartOptions {
 	cwd: string;
-	systemPromptAppend?: string;
 	signal?: AbortSignal;
 }
 
@@ -85,10 +49,12 @@ export interface AcpSessionResumeOptions extends AcpSessionStartOptions {
 export interface AcpPromptCall {
 	sessionId: string;
 	prompt: AcpPromptBlock[];
-	onUpdate: (update: AcpSessionUpdate) => void;
-	onRawUpdate?: (params: unknown) => void;
 	signal?: AbortSignal;
+	/** A steering prompt joins the running turn instead of waiting for it. */
+	steer?: boolean;
 }
+
+export type AcpUpdateListener = (update: AcpSessionUpdate, raw: unknown) => void;
 
 /** Transport interface used by `provider.ts` (implemented by `AgyAcpClient` and test doubles). */
 export interface AcpTransport {
@@ -98,6 +64,8 @@ export interface AcpTransport {
 	closeSession(sessionId: string): Promise<void>;
 	sessionConfig(sessionId: string): AcpSessionConfig | undefined;
 	setConfigOption(sessionId: string, configId: string, value: string, signal?: AbortSignal): Promise<AcpSessionConfig>;
+	/** Routes `session/update` notifications for one session; `undefined` removes the listener. */
+	setUpdateListener(sessionId: string, listener: AcpUpdateListener | undefined): void;
 	prompt(request: AcpPromptCall): Promise<AcpPromptResult>;
 	cancel(sessionId: string): void;
 	dispose(): void;
@@ -115,11 +83,10 @@ export class AcpRpcError extends Error {
 
 export interface AgyAcpClientOptions {
 	binaryPath?: string;
-	cacheDir: string;
-	/** When set, exposes Pi's in-memory MCP server with `timeoutSeconds: -1`. When omitted, configures zero MCP servers. */
-	mcpEndpoint?: AcpMcpEndpoint;
-	/** When true, uses an isolated per-process app data directory instead of symlinking the shared SQLite store. */
-	ephemeral?: boolean;
+	/** Added to the environment `agy acp` and its hooks inherit. */
+	env?: Record<string, string>;
+	/** Decides Agy's `session/request_permission` requests; returns true to allow once. */
+	onPermissionRequest?: (request: AcpPermissionRequest) => boolean;
 	handshakeTimeoutMs?: number;
 	log?: (message: string) => void;
 }
@@ -154,182 +121,6 @@ export function resolveAgyBinary(override?: string): string | undefined {
 		}
 	}
 	return undefined;
-}
-
-function isPidAlive(pid: number): boolean {
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch (error) {
-		return (error as NodeJS.ErrnoException).code === "EPERM";
-	}
-}
-
-let instanceSeq = 0;
-
-function sweepDeadInstances(instancesRoot: string): void {
-	let entries: string[];
-	try {
-		entries = readdirSync(instancesRoot);
-	} catch {
-		return;
-	}
-	for (const name of entries) {
-		if (!name.startsWith("pid-")) continue;
-		const pid = Number(name.slice("pid-".length).split("-", 1)[0]);
-		if (!Number.isInteger(pid) || pid <= 0 || pid === process.pid) continue;
-		if (isPidAlive(pid)) continue;
-		try {
-			rmSync(join(instancesRoot, name), { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
-		} catch {
-			// Best effort.
-		}
-	}
-}
-
-function safeMtimeMs(filePath: string): number | undefined {
-	try {
-		return statSync(filePath).mtimeMs;
-	} catch {
-		return undefined;
-	}
-}
-
-function safeRm(targetPath: string, recursive = false): void {
-	try {
-		rmSync(targetPath, { recursive, force: true });
-	} catch {
-		// Best effort.
-	}
-}
-
-function safeReaddir(dirPath: string): string[] {
-	try {
-		return readdirSync(dirPath);
-	} catch {
-		return [];
-	}
-}
-
-/**
- * Best-effort TTL cleanup for the shared `antigravity-cli/` cache directory.
- * Removes stale conversation DBs (and matching brain/annotations/implicit files)
- * older than 14 days, logs/crashes older than 7 days, and stray `.tmp` files
- * older than 1 hour. Never touches `conversation_summaries.db` (reconciled by `agy`).
- */
-export function sweepStaleAppData(appDataDir: string, nowMs = Date.now()): void {
-	const conversationsDir = join(appDataDir, "conversations");
-	const brainDir = join(appDataDir, "brain");
-	const annotationsDir = join(appDataDir, "annotations");
-	const implicitDir = join(appDataDir, "implicit");
-	const annotationEntries = safeReaddir(annotationsDir);
-
-	const liveIds = new Set<string>();
-	for (const name of safeReaddir(conversationsDir)) {
-		if (!name.endsWith(".db")) continue;
-		const id = name.slice(0, -".db".length);
-		const dbPath = join(conversationsDir, name);
-		const walPath = `${dbPath}-wal`;
-		const dbMtime = safeMtimeMs(dbPath);
-		if (dbMtime === undefined) continue;
-		const walMtime = safeMtimeMs(walPath) ?? 0;
-		const latestMtime = Math.max(dbMtime, walMtime);
-		if (nowMs - latestMtime <= CONVERSATION_TTL_MS) {
-			liveIds.add(id);
-			continue;
-		}
-		safeRm(dbPath);
-		safeRm(walPath);
-		safeRm(`${dbPath}-shm`);
-		safeRm(join(brainDir, id), true);
-		safeRm(join(implicitDir, `${id}.pb`));
-		for (const ann of annotationEntries) {
-			if (ann === id || ann.startsWith(`${id}.`)) safeRm(join(annotationsDir, ann));
-		}
-	}
-
-	// Clean up orphaned brain directories with no active conversation DB.
-	for (const id of safeReaddir(brainDir)) {
-		if (liveIds.has(id)) continue;
-		const dirPath = join(brainDir, id);
-		const mtime = safeMtimeMs(dirPath);
-		if (mtime !== undefined && nowMs - mtime > CONVERSATION_TTL_MS) {
-			safeRm(dirPath, true);
-		}
-	}
-
-	// Clean up old ACP server logs and crash logs.
-	for (const sub of ["log", "crashes"] as const) {
-		const subDir = join(appDataDir, sub);
-		for (const name of safeReaddir(subDir)) {
-			const filePath = join(subDir, name);
-			const mtime = safeMtimeMs(filePath);
-			if (mtime !== undefined && nowMs - mtime > LOG_TTL_MS) {
-				safeRm(filePath);
-			}
-		}
-	}
-
-	// Clean up stray `.tmp` files left behind by interrupted atomic writes.
-	for (const name of safeReaddir(appDataDir)) {
-		if (!name.endsWith(".tmp")) continue;
-		const filePath = join(appDataDir, name);
-		const mtime = safeMtimeMs(filePath);
-		if (mtime !== undefined && nowMs - mtime > TMP_FILE_TTL_MS) {
-			safeRm(filePath);
-		}
-	}
-}
-
-function createIsolatedGeminiDir(
-	cacheDir: string,
-	mcpEndpoint: AcpMcpEndpoint | undefined,
-	ephemeral = false,
-): string {
-	const absCacheDir = resolve(cacheDir);
-	const sharedAppDataDir = join(absCacheDir, APP_DATA_DIR_NAME);
-	const instancesRoot = join(absCacheDir, "instances");
-
-	if (!ephemeral) {
-		mkdirSync(sharedAppDataDir, { recursive: true, mode: 0o700 });
-		sweepStaleAppData(sharedAppDataDir);
-	}
-	mkdirSync(instancesRoot, { recursive: true, mode: 0o700 });
-	sweepDeadInstances(instancesRoot);
-
-	const instanceDir = join(instancesRoot, `pid-${process.pid}-${++instanceSeq}`);
-	const agentDir = join(instanceDir, "config", "agents", AGENT_NAME);
-	mkdirSync(agentDir, { recursive: true, mode: 0o700 });
-
-	// Main sessions share the SQLite conversation store across restarts while
-	// keeping `config/` isolated per process. Ephemeral aux transports get their
-	// own isolated app data directory so throwaway calls never contend on SQLite.
-	const instanceAppData = join(instanceDir, APP_DATA_DIR_NAME);
-	if (ephemeral) {
-		mkdirSync(instanceAppData, { recursive: true, mode: 0o700 });
-	} else if (!existsSync(instanceAppData)) {
-		symlinkSync(sharedAppDataDir, instanceAppData, IS_WINDOWS ? "junction" : "dir");
-	}
-
-	writeFileSync(join(agentDir, "agent.md"), PI_HOST_AGENT_MD, { mode: 0o600 });
-
-	const mcpConfig = mcpEndpoint
-		? {
-				mcpServers: {
-					[MCP_SERVER_NAME]: {
-						serverUrl: mcpEndpoint.url,
-						headers: { [MCP_TOKEN_HEADER]: mcpEndpoint.token },
-						timeoutSeconds: -1,
-					},
-				},
-			}
-		: { mcpServers: {} };
-
-	writeFileSync(join(instanceDir, "config", "mcp_config.json"), `${JSON.stringify(mcpConfig, null, 2)}\n`, {
-		mode: 0o600,
-	});
-
-	return instanceDir;
 }
 
 const abortError = (): Error => new Error("Request was aborted");
@@ -404,7 +195,6 @@ interface PendingRequest {
 
 interface Connection {
 	proc: ChildProcessWithoutNullStreams;
-	instanceDir: string;
 	sessions: Map<string, AcpSessionConfig>;
 }
 
@@ -417,7 +207,7 @@ export class AgyAcpClient implements AcpTransport {
 	private disposed = false;
 	private nextId = 1;
 	private readonly pending = new Map<RpcId, PendingRequest>();
-	private activeTurn: AcpPromptCall | null = null;
+	private readonly listeners = new Map<string, AcpUpdateListener>();
 	private draining: Promise<void> = Promise.resolve();
 
 	constructor(options: AgyAcpClientOptions) {
@@ -434,22 +224,11 @@ export class AgyAcpClient implements AcpTransport {
 
 	async createSession(options: AcpSessionStartOptions): Promise<{ sessionId: string; config: AcpSessionConfig }> {
 		await this.ensureReady(options.signal);
-		const conn = this.conn;
-		if (!conn) throw new Error("agy acp is not running");
-
-		const params: Record<string, unknown> = {
-			cwd: options.cwd,
-			mcpServers: [],
-		};
-		if (options.systemPromptAppend && options.systemPromptAppend.trim().length > 0) {
-			params._meta = {
-				antigravity: {
-					systemPrompt: { append: options.systemPromptAppend },
-				},
-			};
-		}
-
-		const raw = await abortable(this.request("session/new", params, this.handshakeTimeoutMs), options.signal);
+		const conn = this.requireConnection();
+		const raw = await abortable(
+			this.request("session/new", { cwd: options.cwd, mcpServers: [] }, this.handshakeTimeoutMs),
+			options.signal,
+		);
 		const parsed = parseNewSessionResult(raw);
 		conn.sessions.set(parsed.sessionId, parsed.config);
 		return parsed;
@@ -457,29 +236,22 @@ export class AgyAcpClient implements AcpTransport {
 
 	async resumeSession(options: AcpSessionResumeOptions): Promise<{ sessionId: string; config: AcpSessionConfig }> {
 		await this.ensureReady(options.signal);
-		const conn = this.conn;
-		if (!conn) throw new Error("agy acp is not running");
-
-		const params: Record<string, unknown> = {
-			sessionId: options.sessionId,
-			cwd: options.cwd,
-			mcpServers: [],
-		};
-		if (options.systemPromptAppend && options.systemPromptAppend.trim().length > 0) {
-			params._meta = {
-				antigravity: {
-					systemPrompt: { append: options.systemPromptAppend },
-				},
-			};
-		}
-
-		const raw = await abortable(this.request("session/resume", params, this.handshakeTimeoutMs), options.signal);
+		const conn = this.requireConnection();
+		const raw = await abortable(
+			this.request(
+				"session/resume",
+				{ sessionId: options.sessionId, cwd: options.cwd, mcpServers: [] },
+				this.handshakeTimeoutMs,
+			),
+			options.signal,
+		);
 		const config = parseSessionConfig(raw);
 		conn.sessions.set(options.sessionId, config);
 		return { sessionId: options.sessionId, config };
 	}
 
 	async closeSession(sessionId: string): Promise<void> {
+		this.listeners.delete(sessionId);
 		const conn = this.conn;
 		if (!conn) return;
 		conn.sessions.delete(sessionId);
@@ -511,36 +283,27 @@ export class AgyAcpClient implements AcpTransport {
 		return nextConfig;
 	}
 
+	setUpdateListener(sessionId: string, listener: AcpUpdateListener | undefined): void {
+		if (listener) this.listeners.set(sessionId, listener);
+		else this.listeners.delete(sessionId);
+	}
+
 	async prompt(request: AcpPromptCall): Promise<AcpPromptResult> {
-		if (this.activeTurn) {
-			throw new Error("Another agy acp prompt is already in flight");
-		}
-		this.activeTurn = request;
-		try {
-			await this.draining;
-			if (request.signal?.aborted) {
-				return { stopReason: "cancelled", usage: undefined };
-			}
-			const response = this.request("session/prompt", {
-				sessionId: request.sessionId,
-				prompt: request.prompt,
-			});
-			const finished = response.then((raw) => parsePromptResult(raw));
-			const signal = request.signal;
-			if (!signal) return await finished;
-			return await new Promise<AcpPromptResult>((resolvePromise, rejectPromise) => {
-				const onAbort = () => {
-					if (this.activeTurn === request) this.activeTurn = null;
-					this.cancel(request.sessionId);
-					this.draining = settleWithin(response, CANCEL_GRACE_MS);
-					resolvePromise({ stopReason: "cancelled", usage: undefined });
-				};
-				signal.addEventListener("abort", onAbort, { once: true });
-				finished.then(resolvePromise, rejectPromise).finally(() => signal.removeEventListener("abort", onAbort));
-			});
-		} finally {
-			if (this.activeTurn === request) this.activeTurn = null;
-		}
+		if (!request.steer) await this.draining;
+		if (request.signal?.aborted) return { stopReason: "cancelled", usage: undefined };
+		const response = this.request("session/prompt", { sessionId: request.sessionId, prompt: request.prompt });
+		const finished = response.then((raw) => parsePromptResult(raw));
+		const signal = request.signal;
+		if (!signal) return await finished;
+		return await new Promise<AcpPromptResult>((resolvePromise, rejectPromise) => {
+			const onAbort = () => {
+				this.cancel(request.sessionId);
+				this.draining = settleWithin(response, CANCEL_GRACE_MS);
+				resolvePromise({ stopReason: "cancelled", usage: undefined });
+			};
+			signal.addEventListener("abort", onAbort, { once: true });
+			finished.then(resolvePromise, rejectPromise).finally(() => signal.removeEventListener("abort", onAbort));
+		});
 	}
 
 	cancel(sessionId: string): void {
@@ -550,6 +313,11 @@ export class AgyAcpClient implements AcpTransport {
 	dispose(): void {
 		this.disposed = true;
 		if (this.conn) this.close(this.conn, new Error("AgyAcpClient was disposed"));
+	}
+
+	private requireConnection(): Connection {
+		if (!this.conn) throw new Error("agy acp is not running");
+		return this.conn;
 	}
 
 	private async handshake(): Promise<AcpAgentInfo> {
@@ -587,31 +355,13 @@ export class AgyAcpClient implements AcpTransport {
 				"Antigravity CLI ('agy') was not found on PATH. Install it or set PI_AGY_ACP_BIN to its path.",
 			);
 		}
-		const instanceDir = createIsolatedGeminiDir(
-			this.options.cacheDir,
-			this.options.mcpEndpoint,
-			this.options.ephemeral,
-		);
-		const args = [
-			"acp",
-			"--stdio",
-			"--agent",
-			AGENT_NAME,
-			"--include-default-customizations=false",
-			"--disable-telemetry",
-			"--gemini-dir",
-			instanceDir,
-			"--app-data-dir",
-			APP_DATA_DIR_NAME,
-		];
-
-		const proc = spawn(binary, args, {
-			env: { ...process.env },
+		const proc = spawn(binary, ["acp"], {
+			env: { ...process.env, ...this.options.env },
 			detached: !IS_WINDOWS,
 			stdio: ["pipe", "pipe", "pipe"],
 		});
 
-		const conn: Connection = { proc, instanceDir, sessions: new Map() };
+		const conn: Connection = { proc, sessions: new Map() };
 		this.conn = conn;
 		trackProcess(proc);
 
@@ -643,12 +393,6 @@ export class AgyAcpClient implements AcpTransport {
 		for (const entry of [...this.pending.values()]) entry.reject(reason);
 		this.pending.clear();
 		terminateProcess(conn.proc);
-		// Remove only the per-instance config/symlink dir; shared SQLite store stays intact.
-		try {
-			rmSync(conn.instanceDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
-		} catch {
-			// Best effort (Windows or busy file handles).
-		}
 	}
 
 	private write(message: object): boolean {
@@ -705,11 +449,10 @@ export class AgyAcpClient implements AcpTransport {
 
 		if (message.kind === "request") {
 			if (message.method === "session/request_permission") {
-				this.write({
-					jsonrpc: "2.0",
-					id: message.id,
-					result: piToolPermission(message.params, this.options.mcpEndpoint !== undefined),
-				});
+				const request = parsePermissionRequest(message.params);
+				const allow = this.options.onPermissionRequest?.(request) ?? false;
+				this.log(`permission request ${request.toolCallId ?? "?"} (${request.title ?? "?"}) -> ${allow ? "allow" : "reject"}`);
+				this.write({ jsonrpc: "2.0", id: message.id, result: permissionOutcome(message.params, allow) });
 				return;
 			}
 			this.write({
@@ -743,10 +486,9 @@ export class AgyAcpClient implements AcpTransport {
 			const nextConfig = existing && parseConfigOptionUpdate(params, existing);
 			if (existing && nextConfig) conn.sessions.set(sessionId, nextConfig);
 		}
-		const turn = this.activeTurn;
-		if (!turn || sessionId !== turn.sessionId) return;
-		turn.onRawUpdate?.(params);
+		const listener = this.listeners.get(sessionId);
+		if (!listener) return;
 		const update = parseSessionUpdate(params);
-		if (update) turn.onUpdate(update);
+		if (update) listener(update, params);
 	}
 }

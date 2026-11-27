@@ -1,14 +1,13 @@
 {
 	"name": "pi-agy-acp",
-	"version": "0.1.0",
-	"description": "Pi provider backed by Antigravity CLI ACP (`agy acp`) with full Pi tool execution over an in-memory MCP bridge",
+	"version": "0.2.0",
+	"description": "Pi provider that runs the stock Antigravity agent (`agy acp`) and routes its tool calls through Pi's permissions",
 	"keywords": [
 		"pi-package",
 		"pi",
 		"pi-extension",
 		"antigravity",
-		"acp",
-		"mcp"
+		"acp"
 	],
 	"license": "MIT",
 	"author": "Gage Vander Clay <gvanderclay@gmail.com>",

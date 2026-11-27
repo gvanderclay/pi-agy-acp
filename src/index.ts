@@ -1,50 +1,35 @@
 /**
- * Pi extension entry point: registers the `agy-acp` provider backed by
- * Antigravity CLI ACP (`agy acp`) with full Pi tool execution.
+ * Pi extension entry point: registers the `agy-native` provider, which runs the
+ * stock Antigravity agent (`agy acp`) and routes its tool calls through Pi.
  */
 
 import { appendFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { getAgentDir, type ExtensionAPI, type SessionEntry } from "@earendil-works/pi-coding-agent";
+import type { Message } from "@earendil-works/pi-ai";
+import { getAgentDir, type ExtensionAPI, type ExtensionContext, type SessionEntry } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+import {
+	AGY_COMMAND_TOOL,
+	AGY_EDIT_TOOL,
+	AGY_OTHER_TOOL,
+	AGY_PROVIDER_ID,
+	AGY_TOOL_NAMES,
+	agyTurnMark,
+	createAgyNativeProvider,
+	type AgyTurnMark,
+	type SessionView,
+} from "./provider.ts";
 import { isRecord } from "./acp-wire.ts";
-import { createAgyAcpProvider, type PersistedAcpBinding } from "./provider.ts";
-import type { HostPromptSources } from "./prompt.ts";
 
-const BINDING_ENTRY_TYPE = "agy-acp-state";
-
-function extractPersistedBinding(branch: readonly SessionEntry[]): PersistedAcpBinding | undefined {
-	for (let i = branch.length - 1; i >= 0; i--) {
-		const entry = branch[i];
-		if (entry.type !== "custom" || entry.customType !== BINDING_ENTRY_TYPE) continue;
-		const data = entry.data;
-		if (
-			isRecord(data) &&
-			typeof data.piSessionId === "string" &&
-			typeof data.acpSessionId === "string" &&
-			typeof data.syncedFingerprint === "string" &&
-			typeof data.systemPromptHash === "string" &&
-			typeof data.cwd === "string" &&
-			typeof data.modelId === "string"
-		) {
-			return {
-				configurationVersion: typeof data.configurationVersion === "number" ? data.configurationVersion : undefined,
-				piSessionId: data.piSessionId,
-				acpSessionId: data.acpSessionId,
-				syncedFingerprint: data.syncedFingerprint,
-				systemPromptHash: data.systemPromptHash,
-				cwd: data.cwd,
-				modelId: data.modelId,
-			};
-		}
-	}
-	return undefined;
-}
+/** Agy sessions a forked Pi session must not continue; the session it was forked from owns them. */
+const RETIRED_ENTRY_TYPE = "agy-native-retired";
+const COMPACTION_SUMMARY = "Pi compacted its copy of this conversation without a summary. Antigravity keeps the full conversation in its own session.";
 
 function createDebugLogger(cacheDir: string): (message: string) => void {
 	const logPath = join(cacheDir, "debug.log");
 	let target: "unopened" | "file" | "stderr" = "unopened";
 	return (message) => {
-		const line = `${new Date().toISOString()} [agy-acp:${process.pid}] ${message}\n`;
+		const line = `${new Date().toISOString()} [agy-native:${process.pid}] ${message}\n`;
 		if (target !== "stderr") {
 			try {
 				if (target === "unopened") mkdirSync(cacheDir, { recursive: true, mode: 0o700 });
@@ -53,67 +38,155 @@ function createDebugLogger(cacheDir: string): (message: string) => void {
 				return;
 			} catch (error) {
 				target = "stderr";
-				process.stderr.write(`[agy-acp] Cannot write ${logPath}: ${error instanceof Error ? error.message : String(error)}\n`);
+				process.stderr.write(`[agy-native] Cannot write ${logPath}: ${error instanceof Error ? error.message : String(error)}\n`);
 			}
 		}
 		process.stderr.write(line);
 	};
 }
 
-export default function agyAcpExtension(pi: ExtensionAPI): void {
-	const cacheDir = join(getAgentDir(), "cache", "agy-acp");
+function turnMarks(entries: readonly SessionEntry[]): AgyTurnMark[] {
+	return entries.flatMap((entry) => (entry.type === "message" ? (agyTurnMark(entry.message as Message) ?? []) : []));
+}
+
+function retiredSessions(entries: readonly SessionEntry[]): Set<string> {
+	const retired = new Set<string>();
+	for (const entry of entries) {
+		if (entry.type !== "custom" || entry.customType !== RETIRED_ENTRY_TYPE || !isRecord(entry.data)) continue;
+		const ids = entry.data.acpSessionIds;
+		if (Array.isArray(ids)) for (const id of ids) if (typeof id === "string") retired.add(id);
+	}
+	return retired;
+}
+
+const messageText = (content: unknown): string =>
+	typeof content === "string"
+		? content
+		: Array.isArray(content)
+			? content.map((part: unknown) => (isRecord(part) && part.type === "text" && typeof part.text === "string" ? part.text : "")).join("")
+			: "";
+
+export default function agyNativeExtension(pi: ExtensionAPI): void {
+	const cacheDir = join(getAgentDir(), "cache", "agy-native");
 	const log = process.env.PI_AGY_ACP_DEBUG === "1" ? createDebugLogger(cacheDir) : undefined;
 	log?.(`Loaded provider from ${import.meta.url}`);
 
-	let canAppendEntries = false;
-	let promptSources: HostPromptSources | undefined;
+	let session: ExtensionContext | undefined;
+	/** Texts of user messages extensions sent with `sendUserMessage`; Agy is not sent them. */
+	const extensionTexts = new Set<string>();
 
-	const handle = createAgyAcpProvider({
+	const handle = createAgyNativeProvider({
 		cacheDir,
 		log,
-		getPromptSources: () => promptSources,
-		onBindingChange: (binding) => {
-			if (!canAppendEntries) return;
-			try {
-				pi.appendEntry(BINDING_ENTRY_TYPE, binding);
-			} catch (error) {
-				log?.(`appendEntry failed: ${error instanceof Error ? error.message : String(error)}`);
-			}
+		notify: (message) => session?.ui.notify(message, "warning"),
+		getSessionView: (): SessionView | undefined => {
+			const manager = session?.sessionManager;
+			if (!manager) return undefined;
+			const all = manager.getEntries();
+			const latest = new Map<string, number>();
+			for (const mark of turnMarks(all)) latest.set(mark.acpSessionId, Math.max(latest.get(mark.acpSessionId) ?? 0, mark.timestamp));
+			return {
+				branchMark: turnMarks(manager.getBranch()).at(-1),
+				latestTimestamp: (acpSessionId) => latest.get(acpSessionId),
+				retired: retiredSessions(all),
+			};
 		},
 	});
 
 	pi.registerProvider(handle.provider);
 
-	pi.on("session_start", (event, ctx) => {
-		promptSources = undefined;
-		canAppendEntries = true;
-		const persistedBinding = extractPersistedBinding(ctx.sessionManager.getBranch());
-		handle.syncSession({
-			piSessionId: ctx.sessionManager.getSessionId(),
-			cwd: ctx.cwd,
-			persistedBinding,
-			isFork: event.reason === "fork",
+	const run = (toolCallId: string, signal: AbortSignal | undefined) =>
+		handle.runApprovedTool(toolCallId, signal).then(({ text, isError }) => {
+			if (isError) throw new Error(text);
+			return { content: [{ type: "text" as const, text }], details: {} };
 		});
+	const subagent = Type.Optional(Type.Boolean({ description: "True when an Agy subagent made the call" }));
+	pi.registerTool({
+		name: AGY_COMMAND_TOOL,
+		label: "Agy command",
+		description: "A shell command Antigravity wants to run. Only the agy-native provider calls this tool.",
+		parameters: Type.Object({
+			command: Type.String({ description: "Command line" }),
+			cwd: Type.String({ description: "Working directory" }),
+			subagent,
+		}),
+		defaultActive: false,
+		execute: (toolCallId, _params, signal) => run(toolCallId, signal),
+	});
+	pi.registerTool({
+		name: AGY_EDIT_TOOL,
+		label: "Agy edit",
+		description: "A file Antigravity wants to edit. Only the agy-native provider calls this tool.",
+		parameters: Type.Object({ path: Type.String({ description: "File path" }), subagent }),
+		defaultActive: false,
+		execute: (toolCallId, _params, signal) => run(toolCallId, signal),
+	});
+	pi.registerTool({
+		name: AGY_OTHER_TOOL,
+		label: "Agy tool",
+		description: "Another Antigravity tool call. Only the agy-native provider calls this tool.",
+		parameters: Type.Object({
+			tool: Type.String({ description: "Antigravity tool name" }),
+			arguments: Type.Record(Type.String(), Type.Unknown(), { description: "Antigravity tool arguments" }),
+			path: Type.Optional(Type.String({ description: "File the call touches, if any" })),
+			subagent,
+		}),
+		defaultActive: false,
+		execute: (toolCallId, _params, signal) => run(toolCallId, signal),
+	});
+
+	/** The approval tools run only for Agy; other models must not see them. */
+	const syncTools = (onAgy: boolean): void => {
+		const active = new Set(pi.getActiveTools());
+		const before = active.size;
+		for (const name of AGY_TOOL_NAMES) {
+			if (onAgy) active.add(name);
+			else active.delete(name);
+		}
+		if (active.size !== before) pi.setActiveTools([...active]);
+	};
+	const onAgy = (ctx: ExtensionContext): boolean => ctx.model?.provider === AGY_PROVIDER_ID;
+
+	pi.on("session_start", (event, ctx) => {
+		session = ctx;
+		if (event.reason === "fork") {
+			const ids = [...new Set(turnMarks(ctx.sessionManager.getEntries()).map((mark) => mark.acpSessionId))];
+			if (ids.length > 0) pi.appendEntry(RETIRED_ENTRY_TYPE, { acpSessionIds: ids });
+		}
+		handle.syncSession({ piSessionId: ctx.sessionManager.getSessionId(), cwd: ctx.cwd });
+		syncTools(onAgy(ctx));
 	});
 
 	pi.on("session_tree", (_event, ctx) => {
-		promptSources = undefined;
-		const persistedBinding = extractPersistedBinding(ctx.sessionManager.getBranch());
-		handle.syncSession({
-			piSessionId: ctx.sessionManager.getSessionId(),
-			cwd: ctx.cwd,
-			persistedBinding,
+		handle.syncSession({ piSessionId: ctx.sessionManager.getSessionId(), cwd: ctx.cwd });
+	});
+
+	pi.on("model_select", (event) => {
+		syncTools(event.model.provider === AGY_PROVIDER_ID);
+	});
+
+	pi.on("input", (event) => {
+		if (event.source === "extension") extensionTexts.add(event.text);
+	});
+
+	pi.on("context", (event, ctx) => {
+		if (!onAgy(ctx)) return undefined;
+		const messages = event.messages.filter((message) => {
+			if (message.role === "custom" || message.role === "compactionSummary" || message.role === "branchSummary") return false;
+			return message.role !== "user" || !extensionTexts.has(messageText(message.content));
 		});
+		return messages.length === event.messages.length ? undefined : { messages };
 	});
 
-	pi.on("session_compact", () => {
-		handle.invalidateSession("compact");
-	});
-
-	pi.on("before_agent_start", (event) => {
-		// Pi shares this mutable object across handlers. Read it only at request
-		// time, after later extensions have added their rules and sections.
-		promptSources = event.systemPromptOptions;
+	pi.on("session_before_compact", (event, ctx) => {
+		if (!onAgy(ctx)) return undefined;
+		return {
+			compaction: {
+				summary: COMPACTION_SUMMARY,
+				firstKeptEntryId: event.preparation.firstKeptEntryId,
+				tokensBefore: event.preparation.tokensBefore,
+			},
+		};
 	});
 
 	pi.on("context_with_system", (_event, ctx) => {
@@ -129,7 +202,7 @@ export default function agyAcpExtension(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_shutdown", async () => {
-		canAppendEntries = false;
+		session = undefined;
 		await handle.dispose();
 	});
 }

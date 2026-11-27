@@ -1,25 +1,52 @@
 # pi-agy-acp
 
-A native [Pi](https://docs.pi.dev/latest/) provider (`agy-acp`) backed by Google Antigravity CLI's built-in ACP server (`agy acp`), bridging Pi tool execution back into Pi over an ephemeral in-memory Streamable HTTP MCP server.
+A [Pi](https://docs.pi.dev/latest/) provider (`agy-native`) that runs Google's
+stock Antigravity agent (`agy acp`) inside Pi. Agy keeps its own prompt, tools
+and conversation history; Pi supplies the interface and decides which of Agy's
+tool calls may run.
 
 ## How it works
 
-1. **Agy default guidance with Pi-owned context and tools:**
-   Spawns `agy acp --stdio --agent pi-host --include-default-customizations=false` in an isolated per-process cache. The custom agent has an empty body and retains Agy's shared default components (`excludeDefaultComponents: false`), while `tools: []` removes its native filesystem/shell/web/subagent tool set. This is the shared Agy guidance, not its full stock agent identity and workflow. Some native helpers (`list_resources`, `read_resource`, `manage_task`) remain available. Pi's MCP tools are loaded eagerly.
+1. **Stock Agy.** The provider starts `agy acp` with your own Antigravity
+   configuration and an honest `clientInfo`. It sends no system prompt and no
+   tools.
+2. **Every Agy tool call goes through Pi.** On first use the provider adds a
+   `pi-gate` `PreToolUse` entry to `~/.gemini/config/hooks.json` (other entries
+   are kept) that runs `~/.pi/agent/cache/agy-native/pi-gate-hook.mjs`. The
+   script asks the Pi session that started this `agy acp`. An Agy started
+   outside Pi gets `allow` and keeps its own permission flow.
+3. **Approval tool calls.** Pi sees each Agy tool call as a tool call of its
+   own, so pi-permission-system, auto-mode and the approval dialog apply:
+   - `run_command` → `agy_command { command, cwd }` (configure it as a shell
+     tool: `"shellTools": { "agy_command": { "commandArgument": "command", "workdirArgument": "cwd" } }`);
+   - `read_file` → Pi's own `read { path }`, checked against read rules;
+   - `edit_file`, `write_file` → `agy_edit { path }`;
+   - anything else → `agy_tool { tool, arguments, path? }`.
 
-   The append contains project context, delegate roles, skills, explicit tool/extension guidelines, and custom sections. Pi's generated identity, tool descriptions, documentation, and generic rules are omitted; MCP supplies the tool schemas. Agy's implicit project customizations are disabled so Pi owns instruction discovery and trust. Explicit custom prompts and auxiliary task instructions are preserved. Extensions must use `systemPromptOptions.appendSystemPrompt` or structured sections; flattened stock prompts fail locally with instructions to update the extension. Recreate older Paseo delegates after updating Squire.
-2. **In-memory Streamable HTTP MCP bridge (`timeoutSeconds: -1`):**
-   Every Pi tool call parks the ACP turn and emits a real Pi `toolCall` (`stopReason: "toolUse"`), so Pi's `pi-permission-system`, `auto-mode`, `pi-codemode-diff`, and TUI widgets run normally. ACP permission requests are allowed once only for the Pi MCP bridge; native permission requests are declined. The subprocess does not bypass permissions. Dynamic tool changes (`web_enable`, `pi.setActiveTools`) push `notifications/tools/list_changed` over the persistent `GET /mcp` SSE stream mid-session.
-3. **Cross-restart `session/resume` & prompt caching:**
-   Persists the ACP session binding and a fingerprint of the synced conversation prefix via `pi.appendEntry("agy-acp-state", ...)`. While that prefix still matches, including after a restart, the provider sends only new messages and notices. Pi's tools section can change without resuming the session because MCP already updates the tool list. Other system prompt changes request an append update with `session/resume` on the same session at the next ACP prompt boundary. If that request fails, it keeps the warm session with the previous append. Saved bindings are versioned; this configuration update starts a fresh ACP session instead of resuming an old agent configuration. A fresh session replays Pi's transcript when there is no reusable binding or the prefix diverges (for example, after a transcript edit or compaction).
-4. **Stateless auxiliary calls:**
-   One-shot Pi calls (such as `handoff-lite`, compaction, or branch summarization) run on a separate no-tool ACP session so they never interfere with the live conversation.
+   If Pi blocks the call, Agy is told Pi's reason. If Pi allows it, Agy runs
+   it and its output becomes the Pi tool result. Subagent calls are gated the
+   same way and marked `subagent`; Pi cannot see their output. Calls that
+   arrive while no Pi turn is running are denied.
+4. **Only messages you type reach Agy.** Extension messages are not
+   forwarded. A run nobody typed gets "Agy only answers messages you type."
+   without contacting Agy, and side requests (summaries, handoffs) fail so you
+   can pick another model. Compaction keeps Agy's session and writes a fixed
+   summary instead of asking a model.
+5. **History.** Each Agy reply records its Agy session id. The next typed
+   message continues that session, after a restart too (`session/resume`),
+   with turns another model answered in between sent as context. After a fork,
+   or a `/tree` jump that drops Agy's latest reply, Agy starts a fresh session
+   and is sent the conversation Pi kept.
+6. **Turn control.** Esc cancels the Agy turn; a message typed while Agy works
+   is sent as a steering prompt.
 
-Zero-generation terminal ACP warning turns (including `RESOURCE_EXHAUSTED`) are surfaced as errors, not successful assistant replies. They do not advance the saved conversation fingerprint. Squire can then distinguish real quota exhaustion from generic resource-exhaustion failures and select a fallback. Prompt selection is an interoperability measure; it does not establish why Google rejects a request or guarantee account eligibility.
+Pi's context meter counts Pi's own transcript; Agy's token counts are still
+reported for cost.
 
 ## Requirements
 
-- Antigravity CLI (`agy` >= 1.5.17) installed and signed in (`agy --login`), on `PATH` or pointed to via `PI_AGY_ACP_BIN`.
+- Antigravity CLI (`agy` 1.5.18) installed and signed in, on `PATH` or set in
+  `PI_AGY_ACP_BIN`.
 - Pi `>= 1.6.0` on Node `>= 22.19.0`.
 
 ## Installation
@@ -27,22 +54,22 @@ Zero-generation terminal ACP warning turns (including `RESOURCE_EXHAUSTED`) are 
 Add to `~/.pi/agent/settings.json` under `packages`:
 
 ```json
-"~/workspace/pi-agy-acp"
+"git:github.com/gvanderclay/pi-agy-acp"
 ```
 
-(Or `git:github.com/gvanderclay/pi-agy-acp` once published.)
-
-Then `/reload` Pi and pick any `agy-acp/*` model via `/model`.
+Then `/reload` Pi and pick an `agy-native/*` model with `/model`.
 
 ## Environment variables
 
-- `PI_AGY_ACP_BIN`: Explicit path to the `agy` binary (optional; auto-discovered from `PATH`, `/opt/homebrew/bin/agy`, `/usr/local/bin/agy`).
-- `PI_AGY_ACP_DEBUG=1`: Append the loaded extension path, ACP transport lifecycle, replay reasons, and raw per-turn ACP usage to `~/.pi/agent/cache/agy-acp/debug.log` (under `PI_CODING_AGENT_DIR` if set). No stderr redirect is needed.
+- `PI_AGY_ACP_BIN`: path to the `agy` binary (default: found on `PATH`,
+  `/opt/homebrew/bin` or `/usr/local/bin`).
+- `PI_AGY_ACP_DEBUG=1`: log the ACP lifecycle, hook decisions and per-turn usage
+  to `~/.pi/agent/cache/agy-native/debug.log`.
 
 ## Development
 
 ```bash
 pnpm typecheck
 pnpm test
-pnpm test:live   # Runs real end-to-end smoke test against `agy acp`
+pnpm test:live   # real agy acp; installs the pi-gate hook entry
 ```

@@ -6,20 +6,18 @@ import {
 	parsePromptResult,
 	parseRpcMessage,
 	parseSessionUpdate,
-	piToolPermission,
+	permissionOutcome,
 } from "../src/acp-wire.ts";
 
-test("permission responses authorize only the Pi MCP bridge and only once", () => {
-	const request = (name: string) => ({ toolCall: { name }, options: [
+test("permission answers pick a one-time option and never an always option", () => {
+	const request = { toolCall: { toolCallId: "tc-1" }, options: [
 		{ kind: "allow_always", optionId: "always" }, { kind: "allow_once", optionId: "once" },
-	] });
-	assert.deepEqual(piToolPermission(request("mcp_pi-tools_codemode"), true), { outcome: { outcome: "selected", optionId: "once" } });
-	for (const name of ["run_command", "read_file", "manage_task", "mcp_other_shell", "mcp_pi-tools-spoof"]) {
-		assert.deepEqual(piToolPermission(request(name), true), { outcome: { outcome: "cancelled" } });
-	}
-	assert.deepEqual(piToolPermission(request("mcp_pi-tools_codemode"), false), { outcome: { outcome: "cancelled" } });
-	assert.deepEqual(piToolPermission({ ...request("mcp_pi-tools_codemode"), options: [{ kind: "allow_always", optionId: "always" }] }, true), { outcome: { outcome: "cancelled" } });
-	assert.deepEqual(piToolPermission(null, true), { outcome: { outcome: "cancelled" } });
+		{ kind: "reject_always", optionId: "never" }, { kind: "reject_once", optionId: "no" },
+	] };
+	assert.deepEqual(permissionOutcome(request, true), { outcome: { outcome: "selected", optionId: "once" } });
+	assert.deepEqual(permissionOutcome(request, false), { outcome: { outcome: "selected", optionId: "no" } });
+	assert.deepEqual(permissionOutcome({ options: [{ kind: "allow_always", optionId: "always" }] }, true), { outcome: { outcome: "cancelled" } });
+	assert.deepEqual(permissionOutcome(null, true), { outcome: { outcome: "cancelled" } });
 });
 
 test("parseRpcMessage classifies request, notification, success response, and error response", () => {

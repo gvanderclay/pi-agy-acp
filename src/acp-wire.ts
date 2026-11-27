@@ -16,20 +16,33 @@ const optionalString = (value: unknown): string | undefined => (typeof value ===
 const optionalNumber = (value: unknown): number | undefined =>
 	typeof value === "number" && Number.isFinite(value) ? value : undefined;
 
-/** Pi mediates its own MCP tools. Never approve native tools or auxiliary calls. */
-export function piToolPermission(params: unknown, hasPiTools: boolean): {
+export interface AcpPermissionRequest {
+	sessionId: string | undefined;
+	toolCallId: string | undefined;
+	title: string | undefined;
+}
+
+export function parsePermissionRequest(params: unknown): AcpPermissionRequest {
+	const record = isRecord(params) ? params : {};
+	const toolCall = isRecord(record.toolCall) ? record.toolCall : {};
+	return {
+		sessionId: optionalString(record.sessionId),
+		toolCallId: optionalString(toolCall.toolCallId),
+		title: optionalString(toolCall.title),
+	};
+}
+
+/** Answers `session/request_permission` with the first option of the wanted kind, else cancels. */
+export function permissionOutcome(params: unknown, allow: boolean): {
 	outcome: { outcome: "selected"; optionId: string } | { outcome: "cancelled" };
 } {
-	if (hasPiTools && isRecord(params) && isRecord(params.toolCall) &&
-		typeof params.toolCall.name === "string" && params.toolCall.name.startsWith("mcp_pi-tools_") &&
-		Array.isArray(params.options)) {
-		const allow = params.options.find((option: unknown) =>
-			isRecord(option) && option.kind === "allow_once" && typeof option.optionId === "string");
-		if (isRecord(allow) && typeof allow.optionId === "string") {
-			return { outcome: { outcome: "selected", optionId: allow.optionId } };
-		}
-	}
-	return { outcome: { outcome: "cancelled" } };
+	const options = isRecord(params) && Array.isArray(params.options) ? params.options : [];
+	const wanted = allow ? "allow_once" : "reject_once";
+	const option: unknown = options.find((candidate: unknown) =>
+		isRecord(candidate) && candidate.kind === wanted && typeof candidate.optionId === "string");
+	return isRecord(option) && typeof option.optionId === "string"
+		? { outcome: { outcome: "selected", optionId: option.optionId } }
+		: { outcome: { outcome: "cancelled" } };
 }
 
 function oneOf<T extends string>(allowed: readonly T[], value: unknown): T | undefined {
@@ -94,6 +107,8 @@ export type AcpSessionUpdate =
 			toolCallId: string;
 			title: string | undefined;
 			status: string | undefined;
+			rawOutput: unknown;
+			content: unknown;
 	  };
 
 const updateOf = (params: unknown): Record<string, unknown> | undefined =>
@@ -123,6 +138,8 @@ export function parseSessionUpdate(params: unknown): AcpSessionUpdate | null {
 				toolCallId: update.toolCallId,
 				title: optionalString(update.title),
 				status: optionalString(update.status),
+				rawOutput: update.rawOutput,
+				content: update.content,
 			};
 		default:
 			return null;

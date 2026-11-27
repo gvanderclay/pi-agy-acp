@@ -1,88 +1,9 @@
 /**
- * Transcript fingerprinting and prompt rendering between Pi's `TranscriptContext`
- * and ACP `session/prompt` content blocks.
+ * Prompt rendering between Pi messages and ACP `session/prompt` content blocks.
  */
 
-import { createHash } from "node:crypto";
-import {
-	getCurrentSystemMessage,
-	getSystemMessageText,
-	type ImageContent,
-	type Message,
-	type SystemMessage,
-	type TextContent,
-	type ToolResultMessage,
-	type UserMessage,
-} from "@earendil-works/pi-ai";
+import type { ImageContent, Message, TextContent, ToolResultMessage, UserMessage } from "@earendil-works/pi-ai";
 import type { AcpPromptBlock } from "./acp-wire.ts";
-import type { NormalizedBuildSystemPromptOptions } from "@earendil-works/pi-coding-agent";
-
-/** Original sources distinguish required tool/extension rules from Pi boilerplate. */
-export type HostPromptSources = Pick<NormalizedBuildSystemPromptOptions,
-	"selectedTools" | "toolGuidelines" | "promptGuidelines" | "sections">;
-
-function hashText(text: string): string {
-	return createHash("sha256").update(text).digest("hex").slice(0, 16);
-}
-
-function hashImage(img: ImageContent): string {
-	const digest = createHash("sha256").update(img.data).digest("hex").slice(0, 12);
-	return `[image:${img.mimeType}:${digest}]`;
-}
-
-function summarizeUserContent(content: UserMessage["content"]): string {
-	if (typeof content === "string") return content;
-	return content
-		.map((block) => (block.type === "text" ? block.text : hashImage(block)))
-		.join("\n");
-}
-
-function summarizeMessageForFingerprint(message: Message): string {
-	if (message.role === "user") {
-		return `u:${summarizeUserContent(message.content)}`;
-	}
-	if (message.role === "assistant") {
-		const parts = message.content.map((block) => {
-			if (block.type === "text") return `t:${block.text}`;
-			if (block.type === "toolCall") return `c:${block.id}:${block.name}:${JSON.stringify(block.arguments)}`;
-			if (block.type === "thinking") return "";
-			return "";
-		});
-		return `a:${parts.filter(Boolean).join("|")}`;
-	}
-	if (message.role === "toolResult") {
-		const parts = message.content.map((block) => (block.type === "text" ? block.text : hashImage(block)));
-		return `r:${message.toolCallId}:${message.toolName}:${message.isError ? "err" : "ok"}:${parts.join("|")}`;
-	}
-	return "";
-}
-
-/**
- * Deterministic fingerprint of the non-system conversation messages.
- * Ignores thinking blocks and system messages so only semantic conversation
- * turns affect continuity checks.
- */
-export function fingerprintMessages(messages: readonly Message[]): string {
-	const hash = createHash("sha256");
-	let count = 0;
-	for (const message of messages) {
-		if (message.role === "system") continue;
-		count++;
-		hash.update(summarizeMessageForFingerprint(message));
-		hash.update("\0");
-	}
-	return `m${count}-${hash.digest("hex").slice(0, 16)}`;
-}
-
-/** Returns the unsent tail, or null if the ACP session's prefix no longer matches. */
-export function messagesAfterFingerprint(messages: readonly Message[], fingerprint: string): Message[] | null {
-	const match = /^m(\d+)-[0-9a-f]{16}$/.exec(fingerprint);
-	if (!match) return null;
-	const count = Number(match[1]);
-	const conversation = messages.filter((message) => message.role !== "system");
-	if (count > conversation.length || fingerprintMessages(conversation.slice(0, count)) !== fingerprint) return null;
-	return conversation.slice(count);
-}
 
 /** Converts a Pi `UserMessage` into ACP `session/prompt` content blocks (text + images). */
 export function userMessageToPromptBlocks(message: UserMessage): AcpPromptBlock[] {
@@ -112,8 +33,7 @@ function renderContentParts(parts: readonly (TextContent | ImageContent)[]): str
 }
 
 /**
- * Renders full Pi conversation history into ACP prompt blocks for cold starts,
- * `/fork`, `/tree` rewinds, compaction, or cross-provider switches.
+ * Renders the kept Pi conversation into ACP prompt blocks for a fresh Agy session.
  * Preserves images attached to the final user message.
  */
 export function renderTranscriptReplay(messages: readonly Message[]): AcpPromptBlock[] | null {
@@ -124,7 +44,7 @@ export function renderTranscriptReplay(messages: readonly Message[]): AcpPromptB
 	return renderTranscriptPrompt(prior, latestUser, "conversation_history");
 }
 
-/** Sends only conversation messages missing from a warm ACP session. */
+/** Sends the conversation messages a warm Agy session has not seen. */
 export function renderTranscriptDelta(messages: readonly Message[]): AcpPromptBlock[] | null {
 	const latestUserIndex = messages.findLastIndex((message) => message.role === "user");
 	const latestUser = messages[latestUserIndex];
@@ -208,104 +128,4 @@ export function extractPostAssistantTail(messages: readonly Message[]): PostAssi
 	}
 
 	return { toolResults, steeringTexts, steeringImages };
-}
-
-const PI_DEFAULT_PREAMBLE_PREFIXES = [
-	"You are a coding assistant running inside pi, a coding agent harness.",
-	"You are an expert coding assistant operating inside pi, a coding agent harness.",
-] as const;
-
-const PI_OWNED_SECTIONS = ["tools", "rules", "docs"] as const;
-
-let warnedPreambleDrift = false;
-
-/** Reset one-time drift warning latch (for tests). */
-export function _resetSystemPromptWarnings(): void {
-	warnedPreambleDrift = false;
-}
-
-function isDefaultPiPreamble(text: string): boolean {
-	return PI_DEFAULT_PREAMBLE_PREFIXES.some((prefix) => text.startsWith(prefix));
-}
-
-function isPiDocsSection(text: string): boolean {
-	return text.startsWith("<docs>\nPi documentation") && text.endsWith("\n</docs>");
-}
-
-function systemContentText(content: string | TextContent[]): string {
-	if (typeof content === "string") return content;
-	return content.map((part) => part.text).join("");
-}
-
-/**
- * Renders Pi's effective system prompt for ACP `_meta.antigravity.systemPrompt.append`.
- *
- * Agy owns base guidance and MCP owns tool descriptions. Append project context,
- * role/addendum, skills, explicit tool/extension rules, and extension sections.
- *
- * Explicit custom/auxiliary prompts pass through. Flattened stock prompts are
- * rejected locally: their instruction provenance cannot be recovered safely.
- */
-export function renderSystemPromptAppend(messages: readonly Message[], log?: (message: string) => void, sources?: HostPromptSources): string {
-	const sys = getCurrentSystemMessage(messages);
-	return sys ? renderSystemAppend(sys, log, sources) : "";
-}
-
-export function hashSystemPromptAppend(messages: readonly Message[], sources?: HostPromptSources): string {
-	const sys = getCurrentSystemMessage(messages);
-	if (!sys) return hashText("");
-
-	// ACP learns tool changes independently via MCP notifications/tools/list_changed.
-	if (sources?.sections.tools) return hashText(renderSystemAppend(sys, undefined, sources));
-	const { tools: _tools, ...sections } = sys.sections ?? {};
-	return hashText(renderSystemAppend({ ...sys, sections: Object.keys(sections).length > 0 ? sections : undefined }, undefined, sources));
-}
-
-function renderSystemAppend(sys: SystemMessage, log?: (message: string) => void, sources?: HostPromptSources): string {
-	const sections = sys.sections;
-	if (sections) {
-		const preamble = sections.preamble;
-		if (typeof preamble === "string" && isDefaultPiPreamble(preamble)) {
-			const parts: string[] = [];
-			const baseContent = systemContentText(sys.content);
-			if (baseContent.length > 0) parts.push(baseContent);
-
-			for (const [name, value] of Object.entries(sections)) {
-				if (value === null || value.length === 0) continue;
-				if (name === "preamble") continue;
-				if (name === "tools" && !sources?.sections.tools) continue;
-				if (name === "docs" && !sources?.sections.docs && isPiDocsSection(value)) continue;
-				if (name === "rules" && sources && !sources.sections.rules) {
-					const rules = [...new Set([
-						...sources.selectedTools.flatMap((tool) => sources.toolGuidelines[tool] ?? []),
-						...sources.promptGuidelines,
-					].map((rule) => rule.trim()).filter(Boolean))];
-					if (rules.length) parts.push(`<rules>\n${rules.map((rule) => `- ${rule}`).join("\n")}\n</rules>`);
-					continue;
-				}
-				parts.push(value);
-			}
-			return parts.join("\n\n");
-		}
-
-		// Drift detection: if all built-in Pi sections exist alongside an unrecognized
-		// preamble, Pi may have reworded its default preamble upstream.
-		if (
-			!warnedPreambleDrift &&
-			typeof preamble === "string" &&
-			PI_OWNED_SECTIONS.every((name) => typeof sections[name] === "string")
-		) {
-			warnedPreambleDrift = true;
-			log?.(
-				"Pi system prompt has built-in sections with an unrecognized preamble; preserving the custom prompt unchanged.",
-			);
-		}
-		return getSystemMessageText(sys);
-	}
-
-	const rendered = getSystemMessageText(sys);
-	if (isDefaultPiPreamble(rendered)) {
-		throw new Error("Flattened stock Pi system prompt cannot be forwarded to Agy. Update the prompt extension to use systemPromptOptions.appendSystemPrompt or sections; restart older Paseo delegates after updating Squire.");
-	}
-	return rendered;
 }
