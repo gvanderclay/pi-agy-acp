@@ -106,67 +106,83 @@ export default function agyNativeExtension(pi: ExtensionAPI): void {
 			return { content: [{ type: "text" as const, text }], details: {} };
 		});
 	const subagent = Type.Optional(Type.Boolean({ description: "True when an Agy subagent made the call" }));
-	pi.registerTool({
-		name: AGY_COMMAND_TOOL,
-		label: "Agy command",
-		description: "A shell command Antigravity wants to run. Only the agy-native provider calls this tool.",
-		parameters: Type.Object({
-			command: Type.String({ description: "Command line" }),
-			cwd: Type.String({ description: "Working directory" }),
-			subagent,
-		}),
-		defaultActive: false,
-		execute: (toolCallId, _params, signal) => run(toolCallId, signal),
-	});
-	pi.registerTool({
-		name: AGY_EDIT_TOOL,
-		label: "Agy edit",
-		description: "A file Antigravity wants to edit. Only the agy-native provider calls this tool.",
-		parameters: Type.Object({ path: Type.String({ description: "File path" }), subagent }),
-		defaultActive: false,
-		execute: (toolCallId, _params, signal) => run(toolCallId, signal),
-	});
-	pi.registerTool({
-		name: AGY_SEARCH_TOOL,
-		label: "Agy web search",
-		description: "A web search Antigravity wants to run. Only the agy-native provider calls this tool.",
-		parameters: Type.Object({ query: Type.String({ description: "Search query" }), subagent }),
-		defaultActive: false,
-		execute: (toolCallId, _params, signal) => run(toolCallId, signal),
-	});
-	const agyArguments = Type.Record(Type.String(), Type.Unknown(), { description: "Antigravity tool arguments" });
-	pi.registerTool({
-		name: AGY_SUBAGENT_TOOL,
-		label: "Agy subagent",
-		description: "An Antigravity subagent Antigravity wants to start. Only the agy-native provider calls this tool.",
-		parameters: Type.Object({ arguments: agyArguments, subagent }),
-		defaultActive: false,
-		execute: (toolCallId, _params, signal) => run(toolCallId, signal),
-	});
-	pi.registerTool({
-		name: AGY_MESSAGE_TOOL,
-		label: "Agy message",
-		description: "A message between Antigravity's agent and its subagents. Only the agy-native provider calls this tool.",
-		parameters: Type.Object({ arguments: agyArguments, subagent }),
-		defaultActive: false,
-		execute: (toolCallId, _params, signal) => run(toolCallId, signal),
-	});
-	pi.registerTool({
-		name: AGY_OTHER_TOOL,
-		label: "Agy tool",
-		description: "Another Antigravity tool call. Only the agy-native provider calls this tool.",
-		parameters: Type.Object({
-			tool: Type.String({ description: "Antigravity tool name" }),
-			arguments: Type.Record(Type.String(), Type.Unknown(), { description: "Antigravity tool arguments" }),
-			path: Type.Optional(Type.String({ description: "File the call touches, if any" })),
-			subagent,
-		}),
-		defaultActive: false,
-		execute: (toolCallId, _params, signal) => run(toolCallId, signal),
-	});
+	// A hidden tool is registered but never declared or callable. An inactive one is not enough: when an
+	// extension registers a tool, Pi re-activates every inactive tool a `--tools` allowlist names.
+	const registerApprovalTools = (exposure: "direct" | "hidden"): void => {
+		pi.registerTool({
+			name: AGY_COMMAND_TOOL,
+			label: "Agy command",
+			description: "A shell command Antigravity wants to run. Only the agy-native provider calls this tool.",
+			parameters: Type.Object({
+				command: Type.String({ description: "Command line" }),
+				cwd: Type.String({ description: "Working directory" }),
+				subagent,
+			}),
+			defaultActive: false,
+			exposure,
+			execute: (toolCallId, _params, signal) => run(toolCallId, signal),
+		});
+		pi.registerTool({
+			name: AGY_EDIT_TOOL,
+			label: "Agy edit",
+			description: "A file Antigravity wants to edit. Only the agy-native provider calls this tool.",
+			parameters: Type.Object({ path: Type.String({ description: "File path" }), subagent }),
+			defaultActive: false,
+			exposure,
+			execute: (toolCallId, _params, signal) => run(toolCallId, signal),
+		});
+		pi.registerTool({
+			name: AGY_SEARCH_TOOL,
+			label: "Agy web search",
+			description: "A web search Antigravity wants to run. Only the agy-native provider calls this tool.",
+			parameters: Type.Object({ query: Type.String({ description: "Search query" }), subagent }),
+			defaultActive: false,
+			exposure,
+			execute: (toolCallId, _params, signal) => run(toolCallId, signal),
+		});
+		const agyArguments = Type.Record(Type.String(), Type.Unknown(), { description: "Antigravity tool arguments" });
+		pi.registerTool({
+			name: AGY_SUBAGENT_TOOL,
+			label: "Agy subagent",
+			description: "An Antigravity subagent Antigravity wants to start. Only the agy-native provider calls this tool.",
+			parameters: Type.Object({ arguments: agyArguments, subagent }),
+			defaultActive: false,
+			exposure,
+			execute: (toolCallId, _params, signal) => run(toolCallId, signal),
+		});
+		pi.registerTool({
+			name: AGY_MESSAGE_TOOL,
+			label: "Agy message",
+			description: "A message between Antigravity's agent and its subagents. Only the agy-native provider calls this tool.",
+			parameters: Type.Object({ arguments: agyArguments, subagent }),
+			defaultActive: false,
+			exposure,
+			execute: (toolCallId, _params, signal) => run(toolCallId, signal),
+		});
+		pi.registerTool({
+			name: AGY_OTHER_TOOL,
+			label: "Agy tool",
+			description: "Another Antigravity tool call. Only the agy-native provider calls this tool.",
+			parameters: Type.Object({
+				tool: Type.String({ description: "Antigravity tool name" }),
+				arguments: Type.Record(Type.String(), Type.Unknown(), { description: "Antigravity tool arguments" }),
+				path: Type.Optional(Type.String({ description: "File the call touches, if any" })),
+				subagent,
+			}),
+			defaultActive: false,
+			exposure,
+			execute: (toolCallId, _params, signal) => run(toolCallId, signal),
+		});
+	};
+	registerApprovalTools("hidden");
+	let exposed = false;
 
 	/** The approval tools run only for Agy; other models must not see them. */
 	const syncTools = (onAgy: boolean): void => {
+		if (exposed !== onAgy) {
+			exposed = onAgy;
+			registerApprovalTools(onAgy ? "direct" : "hidden");
+		}
 		const active = new Set(pi.getActiveTools());
 		const before = active.size;
 		for (const name of AGY_TOOL_NAMES) {
