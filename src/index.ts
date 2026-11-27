@@ -59,21 +59,12 @@ function retiredSessions(entries: readonly SessionEntry[]): Set<string> {
 	return retired;
 }
 
-const messageText = (content: unknown): string =>
-	typeof content === "string"
-		? content
-		: Array.isArray(content)
-			? content.map((part: unknown) => (isRecord(part) && part.type === "text" && typeof part.text === "string" ? part.text : "")).join("")
-			: "";
-
 export default function agyNativeExtension(pi: ExtensionAPI): void {
 	const cacheDir = join(getAgentDir(), "cache", "agy-native");
 	const log = process.env.PI_AGY_ACP_DEBUG === "1" ? createDebugLogger(cacheDir) : undefined;
 	log?.(`Loaded provider from ${import.meta.url}`);
 
 	let session: ExtensionContext | undefined;
-	/** Texts of user messages extensions sent with `sendUserMessage`; Agy is not sent them. */
-	const extensionTexts = new Set<string>();
 
 	const handle = createAgyNativeProvider({
 		cacheDir,
@@ -165,16 +156,10 @@ export default function agyNativeExtension(pi: ExtensionAPI): void {
 		syncTools(event.model.provider === AGY_PROVIDER_ID);
 	});
 
-	pi.on("input", (event) => {
-		if (event.source === "extension") extensionTexts.add(event.text);
-	});
-
+	// Agy keeps the full conversation, so it is not sent the fixed summary written below.
 	pi.on("context", (event, ctx) => {
 		if (!onAgy(ctx)) return undefined;
-		const messages = event.messages.filter((message) => {
-			if (message.role === "custom" || message.role === "compactionSummary" || message.role === "branchSummary") return false;
-			return message.role !== "user" || !extensionTexts.has(messageText(message.content));
-		});
+		const messages = event.messages.filter((message) => message.role !== "compactionSummary");
 		return messages.length === event.messages.length ? undefined : { messages };
 	});
 

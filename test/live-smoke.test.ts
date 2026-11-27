@@ -43,3 +43,28 @@ test(
 		}
 	},
 );
+
+test(
+	"live agy acp: a side request follows its instructions",
+	{ skip: !LIVE },
+	async () => {
+		const cacheDir = mkdtempSync(join(tmpdir(), "pi-agy-native-live-"));
+		const handle = createAgyNativeProvider({ cacheDir });
+		try {
+			handle.syncSession({ piSessionId: "live-pi-1", cwd: process.cwd() });
+			const model = handle.provider.getModels().find((m) => m.id === "gemini-4-neon")!;
+			const side = {
+				messages: [
+					createInitialSystemMessage("Reply with only the word that follows 'code:' in the user's message, in upper case.", [])!,
+					{ role: "user", content: "code: pelican", timestamp: Date.now() },
+				],
+			} as TranscriptContext;
+			const reply = await handle.provider.streamSimple(model, side, { signal: new AbortController().signal }).result();
+			assert.equal(reply.stopReason, "stop", reply.errorMessage);
+			assert.match(reply.content.map((part) => (part.type === "text" ? part.text : "")).join(""), /PELICAN/);
+		} finally {
+			await handle.dispose();
+			rmSync(cacheDir, { recursive: true, force: true });
+		}
+	},
+);

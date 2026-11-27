@@ -9,6 +9,7 @@
 import {
 	calculateCost,
 	createAssistantMessageEventStream,
+	getCurrentSystemPrompt,
 	type Api,
 	type AssistantMessage,
 	type AssistantMessageEventStream,
@@ -47,9 +48,6 @@ export const AGY_COMMAND_TOOL = "agy_command";
 export const AGY_EDIT_TOOL = "agy_edit";
 export const AGY_OTHER_TOOL = "agy_tool";
 export const AGY_TOOL_NAMES = [AGY_COMMAND_TOOL, AGY_EDIT_TOOL, AGY_OTHER_TOOL] as const;
-export const TYPED_ONLY_REPLY = "Agy only answers messages you type.";
-/** `responseId` of a reply Pi wrote without contacting Agy. */
-export const DECLINED_RESPONSE_ID = "agy-native:declined";
 /** `responseId` prefix naming the Agy session that produced a reply. */
 const SESSION_RESPONSE_PREFIX = "agy:";
 
@@ -557,7 +555,7 @@ const userText = (message: Message): string =>
 			: message.content.map((part) => (part.type === "text" ? part.text : "")).join("")
 		: "";
 
-/** Drops what Agy must not be sent: Pi's own declines and the results of Agy's approval tool calls. */
+/** Drops what Agy must not be sent: the results of Agy's own approval tool calls. */
 function forwardable(messages: readonly Message[], all: readonly Message[]): Message[] {
 	const agyCallIds = new Set(
 		all.flatMap((message) =>
@@ -568,7 +566,7 @@ function forwardable(messages: readonly Message[], all: readonly Message[]): Mes
 	);
 	return messages.filter((message) => {
 		if (message.role === "system") return false;
-		if (message.role === "assistant") return message.responseId !== DECLINED_RESPONSE_ID;
+		if (message.role === "assistant") return true;
 		if (message.role === "toolResult") return !agyCallIds.has(message.toolCallId);
 		return userText(message).trim().length > 0 || (typeof message.content !== "string" && message.content.length > 0);
 	});
@@ -596,6 +594,8 @@ export function createAgyNativeProvider(options: AgyNativeProviderOptions): AgyN
 	let hookSeq = 0;
 	/** Agy tool calls Pi approved; Agy's own permission prompt for them is answered with allow. */
 	const approvedToolCalls = new Set<string>();
+	/** Agy sessions running a side request; their tool calls are denied. */
+	const sideSessions = new Set<string>();
 
 	const checkAvailable = (): boolean =>
 		options.checkAvailable ? options.checkAvailable() : resolveAgyBinary(options.binaryPath) !== undefined;
@@ -603,6 +603,10 @@ export function createAgyNativeProvider(options: AgyNativeProviderOptions): AgyN
 	const deny = (reason: string): HookDecision => ({ decision: "deny", reason });
 
 	const onGateRequest = ({ call, closed }: GateRequest): Promise<HookDecision> => {
+		if (call.conversationId !== undefined && sideSessions.has(call.conversationId)) {
+			log(`hook ${call.toolName} denied: side request`);
+			return Promise.resolve(deny("Tools are not available for this request."));
+		}
 		const bridge = activeBridge;
 		if (!bridge || bridge.aborted) {
 			log(`hook ${call.toolName} denied: no Pi turn running`);
@@ -877,12 +881,6 @@ export function createAgyNativeProvider(options: AgyNativeProviderOptions): AgyN
 		finishFromStopReason(writer, result.stopReason);
 	};
 
-	const declineTurn = (writer: MessageWriter, message: AssistantMessage, text: string): void => {
-		message.responseId = DECLINED_RESPONSE_ID;
-		writer.append("text", text);
-		writer.done("stop");
-	};
-
 	/** Answers parked hooks from Pi's tool results; returns false if the results do not match. */
 	const resumeParkedTurn = async (
 		bridge: ActiveBridge,
@@ -950,11 +948,6 @@ export function createAgyNativeProvider(options: AgyNativeProviderOptions): AgyN
 		}
 
 		const conversation = context.messages.filter((entry) => entry.role !== "system");
-		const lastAssistant = conversation.findLastIndex((entry) => entry.role === "assistant");
-		if (!conversation.slice(lastAssistant + 1).some((entry) => entry.role === "user")) {
-			declineTurn(writer, message, TYPED_ONLY_REPLY);
-			return;
-		}
 
 		let active: AcpTransport;
 		try {
@@ -1078,6 +1071,75 @@ export function createAgyNativeProvider(options: AgyNativeProviderOptions): AgyN
 		settlePhase(bridge, phase, writer, message, context);
 	}
 
+	/** Pi requests outside the conversation (summaries, handoffs) run on their own Agy session, closed afterwards. */
+	async function runSideRequest(
+		stream: AssistantMessageEventStream,
+		model: Model<Api>,
+		context: TranscriptContext,
+		streamOptions: StreamOptions | undefined,
+	): Promise<void> {
+		const signal = streamOptions?.signal;
+		const message = newMessage(model);
+		const writer = createMessageWriter(stream, message);
+		const replay = renderTranscriptReplay(context.messages);
+		if (!replay) {
+			writer.fail("error", "No prompt content found to send to Antigravity.");
+			return;
+		}
+		// Stock Agy takes no system prompt, so the request's instructions go first in the prompt.
+		const instructions = getCurrentSystemPrompt(context.messages);
+		const promptBlocks: AcpPromptBlock[] = instructions
+			? [{ type: "text", text: `<instructions>\n${instructions}\n</instructions>` }, ...replay]
+			: replay;
+		let active: AcpTransport | undefined;
+		let sessionId: string | undefined;
+		try {
+			active = await ensureTransport();
+			const created = await active.createSession({ cwd: activeCwd, signal });
+			sessionId = created.sessionId;
+			sideSessions.add(sessionId);
+			log(`side request session/new sid=${sessionId}`);
+			await applySessionModelAndThinking(
+				active,
+				sessionId,
+				model,
+				(streamOptions as SimpleStreamOptions | undefined)?.reasoning,
+				true,
+				undefined,
+				undefined,
+				signal,
+			);
+			const rewritten = (await streamOptions?.onPayload?.({ sessionId, prompt: promptBlocks }, model)) as
+				| { prompt?: AcpPromptBlock[] }
+				| undefined;
+			writer.ensureStarted();
+			let latestUsageUpdate: { used: number; size: number } | null = null;
+			active.setUpdateListener(sessionId, (update, raw) => {
+				void Promise.resolve(streamOptions?.onProviderStreamEvent?.(raw, model)).catch((err) =>
+					log(`onProviderStreamEvent failed: ${errorMessage(err)}`),
+				);
+				if (update.type === "usage_update") latestUsageUpdate = { used: update.used, size: update.size };
+				else if (update.type === "agent_message_chunk") writer.append("text", update.text);
+				else if (update.type === "agent_thought_chunk") writer.append("thinking", update.text);
+			});
+			const result = await active.prompt({ sessionId, prompt: rewritten?.prompt ?? promptBlocks, signal });
+			log(`side request raw ACP usage sid=${sessionId}: ${JSON.stringify(result.usage ?? null)}`);
+			message.usage = normalizeTurnUsage(model, result.usage, latestUsageUpdate, 1);
+			const terminalError = terminalAcpError(message, result);
+			if (terminalError) writer.fail("error", terminalError);
+			else finishFromStopReason(writer, result.stopReason);
+		} catch (error) {
+			if (signal?.aborted) writer.fail("aborted", "Request was aborted");
+			else writer.fail("error", errorMessage(error));
+		} finally {
+			if (active && sessionId) {
+				active.setUpdateListener(sessionId, undefined);
+				sideSessions.delete(sessionId);
+				await active.closeSession(sessionId);
+			}
+		}
+	}
+
 	const stream = (
 		model: Model<typeof AGY_API>,
 		context: TranscriptContext,
@@ -1086,12 +1148,9 @@ export function createAgyNativeProvider(options: AgyNativeProviderOptions): AgyN
 		const events = createAssistantMessageEventStream();
 		const live = takeLiveRequest(streamOptions);
 		log(`stream start live=${live} model=${model.id} msgs=${context.messages.length}`);
-		if (!live) {
-			const writer = createMessageWriter(events, newMessage(model));
-			writer.fail("error", "Agy only answers messages you type in Pi. Use another model for summaries and other side requests.");
-			return events;
-		}
-		runTurn(events, model, context, streamOptions).catch((error: unknown) => log(`stream crashed: ${errorMessage(error)}`));
+		(live ? runTurn : runSideRequest)(events, model, context, streamOptions).catch((error: unknown) =>
+			log(`stream crashed: ${errorMessage(error)}`),
+		);
 		return events;
 	};
 

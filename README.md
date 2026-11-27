@@ -27,13 +27,14 @@ tool calls may run.
    it and its output becomes the Pi tool result. Subagent calls are gated the
    same way and marked `subagent`; Pi cannot see their output. Calls that
    arrive while no Pi turn is running are denied.
-4. **Only messages you type reach Agy.** Extension messages are not
-   forwarded. A run nobody typed gets "Agy only answers messages you type."
-   without contacting Agy, and side requests (summaries, handoffs) fail so you
-   can pick another model. Compaction keeps Agy's session and writes a fixed
-   summary instead of asking a model.
-5. **History.** Each Agy reply records its Agy session id. The next typed
-   message continues that session, after a restart too (`session/resume`),
+4. **Turns and side requests.** Every turn reaches Agy, including ones an
+   extension starts (mail, finished background tasks) and the messages
+   extensions add. Side requests (summaries, handoffs) run on a separate Agy
+   session that is closed afterwards; their instructions go first in the
+   prompt and their tool calls are denied. Compaction keeps Agy's session and
+   writes a fixed summary instead of asking a model.
+5. **History.** Each Agy reply records its Agy session id. The next message
+   continues that session, after a restart too (`session/resume`),
    with turns another model answered in between sent as context. After a fork,
    or a `/tree` jump that drops Agy's latest reply, Agy starts a fresh session
    and is sent the conversation Pi kept.

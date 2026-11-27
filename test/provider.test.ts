@@ -19,7 +19,6 @@ import type {
 import type { AcpAgentInfo, AcpPromptResult, AcpSessionConfig, AcpSessionUpdate } from "../src/acp-wire.ts";
 import { GATE_URL_ENV } from "../src/hook-gate.ts";
 import {
-	TYPED_ONLY_REPLY,
 	createAgyNativeProvider,
 	modelsFromSessionConfig,
 	normalizeTurnUsage,
@@ -399,22 +398,33 @@ test("a hook call with no Pi turn running is denied", async () => {
 	}
 });
 
-test("runs nobody typed and side requests get an answer without contacting Agy", async () => {
+test("a side request runs on its own Agy session with its instructions, without tools, and leaves the conversation's session alone", async () => {
 	const { transport, send, handle, model } = setup();
+	let sideHook: { decision: string; reason?: string } | undefined;
 	try {
 		const first = user("hello", 1);
 		const reply = await send([first]);
-		const continuation = await send([first, reply]);
-		assert.equal(continuation.stopReason, "stop");
-		assert.equal(textOf(continuation), TYPED_ONLY_REPLY);
+		transport.promptImpl = async (req) => {
+			sideHook = await transport.hook({ id: "side-1", name: "run_command", args: { CommandLine: "ls" } }, req.sessionId);
+			transport.text(req.sessionId, "the summary");
+			return { stopReason: "end_turn", usage: USAGE };
+		};
+		const sideContext = {
+			messages: [createInitialSystemMessage("Summarize the conversation.", [])!, user("<conversation>hello</conversation>", 5)],
+		} as TranscriptContext;
+		const side = await handle.provider.streamSimple(model, sideContext, { signal: new AbortController().signal }).result();
+		assert.equal(side.stopReason, "stop", side.errorMessage);
+		assert.equal(textOf(side), "the summary");
+		assert.equal(sideHook?.decision, "deny");
+		const sideCall = transport.prompts[1];
+		assert.notEqual(sideCall.sessionId, "acp-1");
+		assert.match(promptText(sideCall), /Summarize the conversation\.[\s\S]*<conversation>hello<\/conversation>/);
+		assert.equal(transport.sessionConfig(sideCall.sessionId), undefined);
 
-		const side = await handle.provider.streamSimple(model, makeContext([user("summarize", 5)]), { signal: new AbortController().signal }).result();
-		assert.equal(side.stopReason, "error");
-		assert.equal(transport.prompts.length, 1);
-
-		const next = await send([first, reply, continuation, user("next", continuation.timestamp + 1)]);
-		assert.equal(next.stopReason, "stop");
-		assert.equal(promptText(transport.prompts[1]), "next");
+		transport.promptImpl = async () => ({ stopReason: "end_turn", usage: USAGE });
+		await send([first, reply, user("next", reply.timestamp + 1)]);
+		assert.equal(transport.prompts[2].sessionId, "acp-1");
+		assert.equal(promptText(transport.prompts[2]), "next");
 	} finally {
 		await handle.dispose();
 	}
