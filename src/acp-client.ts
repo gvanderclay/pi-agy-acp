@@ -29,6 +29,7 @@ import {
 	parseRpcMessage,
 	parseSessionConfig,
 	parseSessionUpdate,
+	piToolPermission,
 	type AcpAgentInfo,
 	type AcpPromptBlock,
 	type AcpPromptResult,
@@ -53,12 +54,17 @@ const IS_WINDOWS = process.platform === "win32";
 
 const PI_HOST_AGENT_MD = `---
 name: ${AGENT_NAME}
-description: Minimal Pi host bridge agent delegating all tool execution to Pi.
+description: Host bridge using Agy default guidance and Pi MCP tools.
 mainAgent: true
-excludeDefaultComponents: true
+subagent: false
+excludeDefaultComponents: false
+inheritCustomizations: false
 inheritMcp: true
+tools: []
+rules: []
+skills: []
+agents: []
 ---
-You are a coding assistant. Follow the provided system instructions and use the available tools directly when needed.
 `;
 
 export interface AcpMcpEndpoint {
@@ -592,7 +598,6 @@ export class AgyAcpClient implements AcpTransport {
 			"--agent",
 			AGENT_NAME,
 			"--include-default-customizations=false",
-			"--dangerously-skip-permissions",
 			"--disable-telemetry",
 			"--gemini-dir",
 			instanceDir,
@@ -699,6 +704,14 @@ export class AgyAcpClient implements AcpTransport {
 		if (!message) return;
 
 		if (message.kind === "request") {
+			if (message.method === "session/request_permission") {
+				this.write({
+					jsonrpc: "2.0",
+					id: message.id,
+					result: piToolPermission(message.params, this.options.mcpEndpoint !== undefined),
+				});
+				return;
+			}
 			this.write({
 				jsonrpc: "2.0",
 				id: message.id,

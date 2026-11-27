@@ -15,6 +15,11 @@ import {
 	type UserMessage,
 } from "@earendil-works/pi-ai";
 import type { AcpPromptBlock } from "./acp-wire.ts";
+import type { NormalizedBuildSystemPromptOptions } from "@earendil-works/pi-coding-agent";
+
+/** Original sources distinguish required tool/extension rules from Pi boilerplate. */
+export type HostPromptSources = Pick<NormalizedBuildSystemPromptOptions,
+	"selectedTools" | "toolGuidelines" | "promptGuidelines" | "sections">;
 
 function hashText(text: string): string {
 	return createHash("sha256").update(text).digest("hex").slice(0, 16);
@@ -211,7 +216,6 @@ const PI_DEFAULT_PREAMBLE_PREFIXES = [
 ] as const;
 
 const PI_OWNED_SECTIONS = ["tools", "rules", "docs"] as const;
-const PI_DOCS_ANCHORS = ["Pi documentation", "pi-coding-agent"] as const;
 
 let warnedPreambleDrift = false;
 
@@ -225,7 +229,7 @@ function isDefaultPiPreamble(text: string): boolean {
 }
 
 function isPiDocsSection(text: string): boolean {
-	return PI_DOCS_ANCHORS.some((anchor) => text.includes(anchor));
+	return text.startsWith("<docs>\nPi documentation") && text.endsWith("\n</docs>");
 }
 
 function systemContentText(content: string | TextContent[]): string {
@@ -236,28 +240,28 @@ function systemContentText(content: string | TextContent[]): string {
 /**
  * Renders Pi's effective system prompt for ACP `_meta.antigravity.systemPrompt.append`.
  *
- * When Pi is using its stock structured system prompt, omits the redundant `preamble`
- * section (since `pi-host/agent.md` already supplies the base agent preamble) and Pi's
- * harness `docs` section, while preserving `tools`, `rules`, `addendum`,
- * `project_context` (`AGENTS.md`), `skills`, `cwd`, and all extension sections verbatim.
+ * Agy owns base guidance and MCP owns tool descriptions. Append project context,
+ * role/addendum, skills, explicit tool/extension rules, and extension sections.
  *
- * Custom `--system-prompt`, forced prompts, and auxiliary prompts pass through untouched.
+ * Explicit custom/auxiliary prompts pass through. Flattened stock prompts are
+ * rejected locally: their instruction provenance cannot be recovered safely.
  */
-export function renderSystemPromptAppend(messages: readonly Message[], log?: (message: string) => void): string {
+export function renderSystemPromptAppend(messages: readonly Message[], log?: (message: string) => void, sources?: HostPromptSources): string {
 	const sys = getCurrentSystemMessage(messages);
-	return sys ? renderSystemAppend(sys, log) : "";
+	return sys ? renderSystemAppend(sys, log, sources) : "";
 }
 
-export function hashSystemPromptAppend(messages: readonly Message[]): string {
+export function hashSystemPromptAppend(messages: readonly Message[], sources?: HostPromptSources): string {
 	const sys = getCurrentSystemMessage(messages);
 	if (!sys) return hashText("");
 
 	// ACP learns tool changes independently via MCP notifications/tools/list_changed.
+	if (sources?.sections.tools) return hashText(renderSystemAppend(sys, undefined, sources));
 	const { tools: _tools, ...sections } = sys.sections ?? {};
-	return hashText(renderSystemAppend({ ...sys, sections: Object.keys(sections).length > 0 ? sections : undefined }));
+	return hashText(renderSystemAppend({ ...sys, sections: Object.keys(sections).length > 0 ? sections : undefined }, undefined, sources));
 }
 
-function renderSystemAppend(sys: SystemMessage, log?: (message: string) => void): string {
+function renderSystemAppend(sys: SystemMessage, log?: (message: string) => void, sources?: HostPromptSources): string {
 	const sections = sys.sections;
 	if (sections) {
 		const preamble = sections.preamble;
@@ -269,7 +273,16 @@ function renderSystemAppend(sys: SystemMessage, log?: (message: string) => void)
 			for (const [name, value] of Object.entries(sections)) {
 				if (value === null || value.length === 0) continue;
 				if (name === "preamble") continue;
-				if (name === "docs" && isPiDocsSection(value)) continue;
+				if (name === "tools" && !sources?.sections.tools) continue;
+				if (name === "docs" && !sources?.sections.docs && isPiDocsSection(value)) continue;
+				if (name === "rules" && sources && !sources.sections.rules) {
+					const rules = [...new Set([
+						...sources.selectedTools.flatMap((tool) => sources.toolGuidelines[tool] ?? []),
+						...sources.promptGuidelines,
+					].map((rule) => rule.trim()).filter(Boolean))];
+					if (rules.length) parts.push(`<rules>\n${rules.map((rule) => `- ${rule}`).join("\n")}\n</rules>`);
+					continue;
+				}
 				parts.push(value);
 			}
 			return parts.join("\n\n");
@@ -284,7 +297,7 @@ function renderSystemAppend(sys: SystemMessage, log?: (message: string) => void)
 		) {
 			warnedPreambleDrift = true;
 			log?.(
-				"Pi system prompt has built-in sections (tools/rules/docs) with an unrecognized preamble; passing through untouched.",
+				"Pi system prompt has built-in sections with an unrecognized preamble; preserving the custom prompt unchanged.",
 			);
 		}
 		return getSystemMessageText(sys);
@@ -292,8 +305,7 @@ function renderSystemAppend(sys: SystemMessage, log?: (message: string) => void)
 
 	const rendered = getSystemMessageText(sys);
 	if (isDefaultPiPreamble(rendered)) {
-		const splitIdx = rendered.indexOf("\n\n");
-		return splitIdx >= 0 ? rendered.slice(splitIdx + 2) : "";
+		throw new Error("Flattened stock Pi system prompt cannot be forwarded to Agy. Update the prompt extension to use systemPromptOptions.appendSystemPrompt or sections; restart older Paseo delegates after updating Squire.");
 	}
 	return rendered;
 }
