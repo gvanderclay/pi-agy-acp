@@ -14,6 +14,7 @@ import {
 	type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { loadAgyNativeConfig } from "./config.ts";
 import {
 	AGY_COMMAND_TOOL,
 	AGY_EDIT_TOOL,
@@ -72,7 +73,8 @@ function retiredSessions(entries: readonly SessionEntry[]): Set<string> {
 export default function agyNativeExtension(pi: ExtensionAPI): void {
 	const cacheDir = join(getAgentDir(), "cache", "agy-native");
 	const log = process.env.PI_AGY_ACP_DEBUG === "1" ? createDebugLogger(cacheDir) : undefined;
-	log?.(`Loaded provider from ${import.meta.url}`);
+	const config = loadAgyNativeConfig(join(getAgentDir(), "agy-native.json"), log);
+	log?.(`Loaded provider from ${import.meta.url} (mcpTools=${config.mcpTools.length})`);
 
 	let session: ExtensionContext | undefined;
 	// The run's prompt options; handlers that run after this one still edit the same object.
@@ -83,7 +85,13 @@ export default function agyNativeExtension(pi: ExtensionAPI): void {
 		geminiDir: join(getAgentDir(), "agy-native"),
 		log,
 		notify: (message) => session?.ui.notify(message, "warning"),
-		getSystemPromptAppend: () => (promptOptions ? agyRoleInstructions(promptOptions) : undefined),
+		mcpToolPatterns: config.mcpTools,
+		getAvailableTools: () => {
+			const active = new Set(pi.getActiveTools());
+			return pi.getAllTools().filter((tool) => tool.exposure !== "hidden" && active.has(tool.name));
+		},
+		getSystemPromptAppend: () =>
+			promptOptions ? agyRoleInstructions(promptOptions, config.systemPromptSections) : undefined,
 		getSessionView: (): SessionView | undefined => {
 			const manager = session?.sessionManager;
 			if (!manager) return undefined;

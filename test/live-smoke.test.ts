@@ -178,3 +178,57 @@ test(
 		}
 	},
 );
+
+test(
+	"live agy acp: a configured Pi tool is callable over ACP MCP and returns Pi's result",
+	{ skip: !LIVE },
+	async () => {
+		const cacheDir = mkdtempSync(join(tmpdir(), "pi-agy-native-live-"));
+		const secretTool = {
+			name: "pi_secret_lookup",
+			description: "Returns the secret project code for a given key.",
+			parameters: {
+				type: "object",
+				properties: { key: { type: "string", description: "Lookup key" } },
+				required: ["key"],
+			} as never,
+		};
+		const handle = createAgyNativeProvider({
+			cacheDir,
+			geminiDir: join(cacheDir, "gemini"),
+			mcpToolPatterns: ["pi_secret_lookup"],
+			getAvailableTools: () => [secretTool],
+		});
+		try {
+			handle.syncSession({ piSessionId: "live-pi-1", cwd: process.cwd() });
+			const model = handle.provider.getModels().find((m) => m.id === MODEL)!;
+			const first: Message = {
+				role: "user",
+				content: "Call the pi_secret_lookup tool with key 'falcon' and reply with the exact code it returns.",
+				timestamp: Date.now(),
+			};
+			const parked = await handle.provider.streamSimple(model, context([first]), live(handle)).result();
+			assert.equal(parked.stopReason, "toolUse", parked.errorMessage);
+			const call = parked.content.find((part) => part.type === "toolCall");
+			assert.ok(call && call.type === "toolCall");
+			assert.equal(call.name, "pi_secret_lookup");
+			assert.equal((call.arguments as { key?: string }).key, "falcon");
+
+			const result: Message = {
+				role: "toolResult",
+				toolCallId: call.id,
+				toolName: call.name,
+				content: [{ type: "text", text: "FALCON-8841" }],
+				isError: false,
+				timestamp: Date.now(),
+			};
+			const done = await handle.provider.streamSimple(model, context([first, parked, result]), live(handle)).result();
+			assert.equal(done.stopReason, "stop", done.errorMessage);
+			const replyText = done.content.map((part) => (part.type === "text" ? part.text : "")).join("");
+			assert.match(replyText, /FALCON-8841/);
+		} finally {
+			await handle.dispose();
+			rmSync(cacheDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 });
+		}
+	},
+);

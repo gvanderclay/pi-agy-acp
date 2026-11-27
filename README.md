@@ -87,6 +87,25 @@ Then `/reload` Pi and pick an `agy-native/*` model with `/model`.
   `/opt/homebrew/bin` or `/usr/local/bin`).
 - `PI_AGY_ACP_DEBUG=1`: log the ACP lifecycle, hook decisions and per-turn usage
   to `~/.pi/agent/cache/agy-native/debug.log`.
+- `PI_AGY_ACP_DISABLE_NATIVE_FORK=1`: disable SQLite copy-on-rewind forking and
+  always replay on `/fork` or `/tree` jumps.
+
+## Optional configuration
+
+Create `~/.pi/agent/agy-native.json` to project selected Pi extension tools
+(such as Squire or Session Mail) to Agy over a per-session local HTTP MCP server
+while keeping Agy's stock prompt and file/shell tools:
+
+```json
+{
+  "mcpTools": ["delegate", "delegation_*", "session_mail_*"],
+  "systemPromptSections": ["squire_delegate_task", "squire_parent_delegation"]
+}
+```
+
+Built-in Pi file/shell tools (`read`, `write`, `edit`, `bash`, `codemode`) and
+`agy_*` approval tools are never projected. Without this file, no MCP server is
+started.
 
 ## Development
 

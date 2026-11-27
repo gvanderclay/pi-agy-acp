@@ -22,13 +22,14 @@ import {
 	type SimpleStreamOptions,
 	type StreamOptions,
 	type ThinkingLevelMap,
+	type Tool,
 	type ToolResultMessage,
 	type TranscriptContext,
 	type Usage,
 } from "@earendil-works/pi-ai";
 import { estimateTokens } from "@earendil-works/pi-coding-agent";
 import { join } from "node:path";
-import { AgyAcpClient, resolveAgyBinary, type AcpTransport } from "./acp-client.ts";
+import { AgyAcpClient, resolveAgyBinary, type AcpMcpServerHttp, type AcpTransport } from "./acp-client.ts";
 import {
 	isRecord,
 	type AcpChoice,
@@ -38,10 +39,19 @@ import {
 	type AcpSessionUpdate,
 	type AcpUsage,
 } from "./acp-wire.ts";
+import { DEFAULT_SYSTEM_PROMPT_SECTIONS, selectMcpTools } from "./config.ts";
 import { defaultConversationStore, type ConversationStore } from "./conversation-store.ts";
 import { terminalAcpError, WarningLineFilter } from "./errors.ts";
 import { GATE_URL_ENV, GateServer, installHook, type GateRequest, type HookDecision, type HookToolCall } from "./hook-gate.ts";
+import {
+	isOwnMcpToolName,
+	MCP_SERVER_NAME,
+	MCP_TOKEN_HEADER,
+	McpBridgeServer,
+	type ParkedMcpCall,
+} from "./mcp-server.ts";
 import { extractPostAssistantTail, renderTranscriptDelta, renderTranscriptReplay, userMessageToPromptBlocks } from "./prompt.ts";
+import { projectPiTools } from "./tools.ts";
 
 export const AGY_PROVIDER_ID = "agy-native";
 export const AGY_API = "agy-native";
@@ -118,24 +128,38 @@ export interface AgyNativeProviderOptions {
 	getSessionView?: () => SessionView | undefined;
 	/** Text appended to Agy's own system prompt for the conversation's session. */
 	getSystemPromptAppend?: () => string | undefined;
+	/** Optional glob patterns of Pi tools to project to Agy over MCP (empty by default). */
+	mcpToolPatterns?: readonly string[];
+	/** Returns active Pi tools eligible for selective MCP projection. */
+	getAvailableTools?: () => readonly Tool[];
 	/** Test seams. */
 	createTransport?: (env: Record<string, string>, onPermissionRequest: (toolCallId: string | undefined) => boolean) => AcpTransport;
 	conversationStore?: ConversationStore;
+	mcpServer?: McpBridgeServer;
 	installGate?: () => void;
 	checkAvailable?: () => boolean;
 }
 
 /**
- * The parts of Pi's system prompt that tell this session its role: the
- * `--append-system-prompt` text (a Squire delegate's role instructions) and
- * the section pi-squire writes for a delegate (src/index.ts,
- * `squire_delegate_task`). The rest describes Pi's tools and harness, which Agy
- * does not have.
+ * The parts of Pi's system prompt that tell this session its role: configured
+ * named sections (by default Squire's `squire_delegate_task`, optionally also
+ * `squire_parent_delegation`, etc.) and `--append-system-prompt`. The rest
+ * describes Pi's built-in file/shell harness, which Agy does not use.
  */
-export function agyRoleInstructions(options: { appendSystemPrompt?: string; sections?: Record<string, string> }): string | undefined {
-	const parts = [options.sections?.squire_delegate_task, options.appendSystemPrompt]
-		.map((part) => part?.trim())
-		.filter((part): part is string => !!part);
+export function agyRoleInstructions(
+	options: { appendSystemPrompt?: string; sections?: Record<string, string> },
+	sectionNames: readonly string[] = DEFAULT_SYSTEM_PROMPT_SECTIONS,
+): string | undefined {
+	const seen = new Set<string>();
+	const parts: string[] = [];
+	for (const name of sectionNames) {
+		if (seen.has(name)) continue;
+		seen.add(name);
+		const text = options.sections?.[name]?.trim();
+		if (text) parts.push(text);
+	}
+	const appended = options.appendSystemPrompt?.trim();
+	if (appended) parts.push(appended);
 	return parts.length > 0 ? parts.join("\n\n") : undefined;
 }
 
@@ -391,7 +415,7 @@ interface ParkedHook {
 }
 
 type PhaseEnd =
-	| { kind: "parked"; hooks: ParkedHook[] }
+	| { kind: "parked"; hooks: ParkedHook[]; mcpCalls: ParkedMcpCall[] }
 	| { kind: "done"; result: AcpPromptResult }
 	| { kind: "error"; error: Error }
 	| { kind: "aborted" };
@@ -410,6 +434,8 @@ interface ActiveBridge {
 	bufferedUpdates: AcpSessionUpdate[];
 	pendingParks: ParkedHook[];
 	awaitingResults: Map<string, ParkedHook>;
+	pendingMcpParks: ParkedMcpCall[];
+	awaitingMcpResults: Map<string, ParkedMcpCall>;
 	parkBatchTimer: NodeJS.Timeout | null;
 	phaseResolve: ((end: PhaseEnd) => void) | null;
 	terminalOutcome: { kind: "done"; result: AcpPromptResult } | { kind: "error"; error: Error } | null;
@@ -663,6 +689,7 @@ export function createAgyNativeProvider(options: AgyNativeProviderOptions): AgyN
 	const parkBatchMs = options.parkBatchMs ?? DEFAULT_PARK_BATCH_MS;
 	const hookDeadlineMs = options.hookDeadlineMs ?? DEFAULT_HOOK_DEADLINE_MS;
 	const conversationStore = options.conversationStore ?? defaultConversationStore;
+	const mcpPatterns = options.mcpToolPatterns ?? [];
 
 	let models: Model<typeof AGY_API>[] = [...BASELINE_MODELS];
 	let activePiSessionId: string | undefined;
@@ -671,6 +698,7 @@ export function createAgyNativeProvider(options: AgyNativeProviderOptions): AgyN
 	let boundSession: BoundSession | null = null;
 	let activeBridge: ActiveBridge | null = null;
 	let transport: AcpTransport | null = null;
+	let mcpServer: McpBridgeServer | null = options.mcpServer ?? null;
 	let hookSeq = 0;
 	/** Agy tool calls Pi approved; Agy's own permission prompt for them is answered with allow. */
 	const approvedToolCalls = new Set<string>();
@@ -691,6 +719,10 @@ export function createAgyNativeProvider(options: AgyNativeProviderOptions): AgyN
 		if (!bridge || bridge.aborted) {
 			log(`hook ${call.toolName} denied: no Pi turn running`);
 			return Promise.resolve(deny("No Pi turn is running, so Pi cannot approve this tool call."));
+		}
+		if (mcpServer && isOwnMcpToolName(call.toolName)) {
+			log(`hook ${call.toolName} -> auto_approve (own MCP tool)`);
+			return Promise.resolve({ decision: "auto_approve" });
 		}
 		return new Promise<HookDecision>((resolvePromise) => {
 			const park: ParkedHook = {
@@ -727,6 +759,47 @@ export function createAgyNativeProvider(options: AgyNativeProviderOptions): AgyN
 	};
 
 	const gate = new GateServer(onGateRequest);
+
+	const onMcpPark = (call: ParkedMcpCall): boolean => {
+		const bridge = activeBridge;
+		if (!bridge || bridge.aborted) {
+			log(`mcp ${call.piName} rejected: no Pi turn running`);
+			return false;
+		}
+		log(`mcp park ${call.piName} ${call.callId}`);
+		bridge.pendingMcpParks.push(call);
+		if (!bridge.parkBatchTimer) {
+			bridge.parkBatchTimer = setTimeout(() => flushPendingParks(bridge), parkBatchMs);
+			bridge.parkBatchTimer.unref();
+		}
+		return true;
+	};
+
+	const onMcpCancel = (callId: string): void => {
+		const bridge = activeBridge;
+		if (!bridge) return;
+		bridge.pendingMcpParks = bridge.pendingMcpParks.filter((call) => call.callId !== callId);
+		bridge.awaitingMcpResults.delete(callId);
+	};
+
+	const ensureMcpServers = async (): Promise<AcpMcpServerHttp[]> => {
+		if (mcpPatterns.length === 0) return [];
+		const selected = selectMcpTools(options.getAvailableTools?.() ?? [], mcpPatterns);
+		const projected = projectPiTools(selected);
+		if (projected.length === 0 && !mcpServer) return [];
+		mcpServer ??= new McpBridgeServer();
+		mcpServer.setParkHandler(onMcpPark, onMcpCancel);
+		await mcpServer.start();
+		await mcpServer.updateTools(projected);
+		return [
+			{
+				type: "http",
+				name: MCP_SERVER_NAME,
+				url: mcpServer.url,
+				headers: [{ name: MCP_TOKEN_HEADER, value: mcpServer.authToken }],
+			},
+		];
+	};
 
 	const ensureTransport = async (): Promise<AcpTransport> => {
 		if (transport) return transport;
@@ -788,6 +861,10 @@ export function createAgyNativeProvider(options: AgyNativeProviderOptions): AgyN
 			bridge.pendingParks = [];
 			for (const park of bridge.awaitingResults.values()) park.answer(deny(reason));
 			bridge.awaitingResults.clear();
+			for (const mcpCall of bridge.pendingMcpParks) mcpCall.reject(reason);
+			bridge.pendingMcpParks = [];
+			for (const mcpCall of bridge.awaitingMcpResults.values()) mcpCall.reject(reason);
+			bridge.awaitingMcpResults.clear();
 			bridge.promptController.abort();
 		}
 
@@ -872,15 +949,22 @@ export function createAgyNativeProvider(options: AgyNativeProviderOptions): AgyN
 		return hooks;
 	};
 
+	const takePendingMcpParks = (bridge: ActiveBridge): ParkedMcpCall[] => {
+		const calls = bridge.pendingMcpParks;
+		bridge.pendingMcpParks = [];
+		for (const call of calls) bridge.awaitingMcpResults.set(call.callId, call);
+		return calls;
+	};
+
 	const flushPendingParks = (bridge: ActiveBridge): void => {
 		if (bridge.parkBatchTimer) {
 			clearTimeout(bridge.parkBatchTimer);
 			bridge.parkBatchTimer = null;
 		}
-		if (bridge.pendingParks.length === 0 || !bridge.phaseResolve) return;
+		if ((bridge.pendingParks.length === 0 && bridge.pendingMcpParks.length === 0) || !bridge.phaseResolve) return;
 		const resolve = bridge.phaseResolve;
 		bridge.phaseResolve = null;
-		resolve({ kind: "parked", hooks: takePendingParks(bridge) });
+		resolve({ kind: "parked", hooks: takePendingParks(bridge), mcpCalls: takePendingMcpParks(bridge) });
 	};
 
 	const awaitBridgePhase = (bridge: ActiveBridge): Promise<PhaseEnd> => {
@@ -890,8 +974,8 @@ export function createAgyNativeProvider(options: AgyNativeProviderOptions): AgyN
 			return Promise.resolve(outcome);
 		}
 		if (bridge.aborted) return Promise.resolve({ kind: "aborted" });
-		if (bridge.pendingParks.some((park) => !park.answered)) {
-			return Promise.resolve({ kind: "parked", hooks: takePendingParks(bridge) });
+		if (bridge.pendingParks.some((park) => !park.answered) || bridge.pendingMcpParks.length > 0) {
+			return Promise.resolve({ kind: "parked", hooks: takePendingParks(bridge), mcpCalls: takePendingMcpParks(bridge) });
 		}
 		return new Promise<PhaseEnd>((resolve) => {
 			bridge.phaseResolve = resolve;
@@ -952,6 +1036,9 @@ export function createAgyNativeProvider(options: AgyNativeProviderOptions): AgyN
 				const call = approvalToolCall(park.call, park.subagent, activeCwd);
 				writer.emitToolCall(park.id, call.name, call.arguments);
 			}
+			for (const mcpCall of phase.mcpCalls) {
+				writer.emitToolCall(mcpCall.callId, mcpCall.piName, mcpCall.args);
+			}
 			writer.done("toolUse");
 			return;
 		}
@@ -1002,7 +1089,12 @@ export function createAgyNativeProvider(options: AgyNativeProviderOptions): AgyN
 	): Promise<boolean> => {
 		const tail = extractPostAssistantTail(context.messages);
 		const resultById = new Map((tail?.toolResults ?? []).map((result) => [result.toolCallId, result]));
-		if (!tail || bridge.model.id !== model.id || ![...bridge.awaitingResults.keys()].every((id) => resultById.has(id))) {
+		if (
+			!tail ||
+			bridge.model.id !== model.id ||
+			![...bridge.awaitingResults.keys()].every((id) => resultById.has(id)) ||
+			![...bridge.awaitingMcpResults.keys()].every((id) => resultById.has(id))
+		) {
 			return false;
 		}
 		message.responseId = `${SESSION_RESPONSE_PREFIX}${bridge.sessionId}`;
@@ -1017,6 +1109,12 @@ export function createAgyNativeProvider(options: AgyNativeProviderOptions): AgyN
 			const result = resultById.get(park.id)!;
 			if (result.isError) park.answer(deny(toolResultText(result) || "Pi blocked this tool call."));
 			else park.answer({ decision: "auto_approve" });
+		}
+		const mcpCalls = [...bridge.awaitingMcpResults.values()];
+		bridge.awaitingMcpResults.clear();
+		for (const mcpCall of mcpCalls) {
+			const result = resultById.get(mcpCall.callId)!;
+			mcpCall.resolve({ content: result.content, isError: result.isError });
 		}
 		if (tail.steeringTexts.length > 0 || tail.steeringImages.length > 0) {
 			const steering: AcpPromptBlock[] = [
@@ -1051,16 +1149,22 @@ export function createAgyNativeProvider(options: AgyNativeProviderOptions): AgyN
 
 		if (activeBridge) {
 			const bridge = activeBridge;
-			if (bridge.awaitingResults.size > 0 &&
-				await resumeParkedTurn(bridge, writer, message, context, model, streamOptions, onRawUpdate)) return;
+			if (
+				(bridge.awaitingResults.size > 0 || bridge.awaitingMcpResults.size > 0) &&
+				(await resumeParkedTurn(bridge, writer, message, context, model, streamOptions, onRawUpdate))
+			) {
+				return;
+			}
 			abandonParkedTurn("Pi transcript changed before deciding on this tool call.");
 		}
 
 		const conversation = context.messages.filter((entry) => entry.role !== "system");
 
 		let active: AcpTransport;
+		let mcpServers: AcpMcpServerHttp[];
 		try {
 			active = await ensureTransport();
+			mcpServers = await ensureMcpServers();
 		} catch (error) {
 			writer.fail("error", errorMessage(error));
 			return;
@@ -1085,6 +1189,7 @@ export function createAgyNativeProvider(options: AgyNativeProviderOptions): AgyN
 							sessionId: mark.acpSessionId,
 							cwd: activeCwd,
 							systemPromptAppend: options.getSystemPromptAppend?.(),
+							mcpServers,
 							signal,
 						});
 						session = { acpSessionId: mark.acpSessionId, lastModelId: undefined, lastThoughtLevel: undefined };
@@ -1113,6 +1218,7 @@ export function createAgyNativeProvider(options: AgyNativeProviderOptions): AgyN
 							sessionId: forkId,
 							cwd: activeCwd,
 							systemPromptAppend: options.getSystemPromptAppend?.(),
+							mcpServers,
 							signal,
 						});
 						log(`session/fork-resume source=${mark.acpSessionId} fork=${forkId}`);
@@ -1129,7 +1235,12 @@ export function createAgyNativeProvider(options: AgyNativeProviderOptions): AgyN
 			if (!session) {
 				if (boundSession) await active.closeSession(boundSession.acpSessionId);
 				boundSession = null;
-				const created = await active.createSession({ cwd: activeCwd, systemPromptAppend: options.getSystemPromptAppend?.(), signal });
+				const created = await active.createSession({
+					cwd: activeCwd,
+					systemPromptAppend: options.getSystemPromptAppend?.(),
+					mcpServers,
+					signal,
+				});
 				log(`session/new sid=${created.sessionId}`);
 				session = { acpSessionId: created.sessionId, lastModelId: undefined, lastThoughtLevel: undefined };
 				needApplySettings = true;
@@ -1194,6 +1305,8 @@ export function createAgyNativeProvider(options: AgyNativeProviderOptions): AgyN
 			bufferedUpdates: [],
 			pendingParks: [],
 			awaitingResults: new Map(),
+			pendingMcpParks: [],
+			awaitingMcpResults: new Map(),
 			parkBatchTimer: null,
 			phaseResolve: null,
 			terminalOutcome: null,
@@ -1422,6 +1535,9 @@ export function createAgyNativeProvider(options: AgyNativeProviderOptions): AgyN
 			boundSession = null;
 			transport?.dispose();
 			transport = null;
+			mcpServer?.setParkHandler(undefined);
+			await mcpServer?.stop();
+			mcpServer = null;
 			await gate.stop();
 		},
 	};

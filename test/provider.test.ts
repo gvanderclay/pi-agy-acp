@@ -699,3 +699,74 @@ test("a rewind or fork resumes a native SQLite fork when available, and falls ba
 		await handle.dispose();
 	}
 });
+
+test("configured Pi tools are projected over MCP, auto-approved in PreToolUse, and executed through Pi", async () => {
+	const delegateTool: Tool = {
+		name: "delegate",
+		description: "Delegate a task to a Squire worker",
+		parameters: { type: "object", properties: { task: { type: "string" } }, required: ["task"] } as never,
+	};
+	const readTool: Tool = {
+		name: "read",
+		description: "Pi read",
+		parameters: { type: "object", properties: { path: { type: "string" } } } as never,
+	};
+	const { transport, send, handle } = setup({
+		mcpToolPatterns: ["delegate", "read"],
+		getAvailableTools: () => [delegateTool, readTool],
+	});
+	let hookDecision: { decision: string; reason?: string } | undefined;
+	let mcpResponse: unknown;
+	transport.promptImpl = async (req) => {
+		const mcp = transport.createdSessions[0]?.mcpServers?.[0];
+		assert.ok(mcp, "expected HTTP MCP server on live session");
+		const headers = { "content-type": "application/json", [mcp.headers[0].name]: mcp.headers[0].value };
+		// Verify only `delegate` (not reserved `read`) is advertised.
+		const listRes = await fetch(mcp.url, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+		});
+		const listJson = (await listRes.json()) as { result: { tools: Array<{ name: string }> } };
+		assert.deepEqual(listJson.result.tools.map((t) => t.name), ["delegate"]);
+
+		// Agy's PreToolUse hook fires first and should auto-approve our own MCP tool without double-gating.
+		hookDecision = await transport.hook({ id: "tc-mcp-1", name: "mcp_pi-tools_delegate", args: { task: "fix bug" } }, req.sessionId);
+
+		// Then Agy invokes the MCP server, which parks until Pi executes the real `delegate` tool.
+		const callRes = await fetch(mcp.url, {
+			method: "POST",
+			headers,
+			body: JSON.stringify({
+				jsonrpc: "2.0",
+				id: 2,
+				method: "tools/call",
+				params: { name: "delegate", arguments: { task: "fix bug" } },
+			}),
+		});
+		mcpResponse = await callRes.json();
+		transport.text(req.sessionId, "Delegated.");
+		return { stopReason: "end_turn", usage: USAGE };
+	};
+	try {
+		const first = user("delegate fixing the bug", 1);
+		const parked = await send([first]);
+		assert.equal(parked.stopReason, "toolUse");
+		const call = parked.content.find((part) => part.type === "toolCall");
+		assert.ok(call && call.type === "toolCall");
+		assert.equal(call.name, "delegate");
+		assert.deepEqual(call.arguments, { task: "fix bug" });
+		assert.deepEqual(hookDecision, { decision: "auto_approve" });
+
+		const done = await send([first, parked, toolResult(parked, "worker-123 launched", false, 3)]);
+		assert.equal(done.stopReason, "stop");
+		assert.equal(textOf(done), "Delegated.");
+		assert.deepEqual(mcpResponse, {
+			jsonrpc: "2.0",
+			id: 2,
+			result: { content: [{ type: "text", text: "worker-123 launched" }] },
+		});
+	} finally {
+		await handle.dispose();
+	}
+});

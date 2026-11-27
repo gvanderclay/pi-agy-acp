@@ -38,10 +38,19 @@ const DEFAULT_HANDSHAKE_TIMEOUT_MS = 30_000;
 const PARENT_SIGNALS = ["SIGINT", "SIGTERM", "SIGHUP"] as const;
 const IS_WINDOWS = process.platform === "win32";
 
+export interface AcpMcpServerHttp {
+	type: "http";
+	name: string;
+	url: string;
+	headers: Array<{ name: string; value: string }>;
+}
+
 export interface AcpSessionStartOptions {
 	cwd: string;
 	/** A session/resume that leaves it out clears the earlier append, so pass it on every call. */
 	systemPromptAppend?: string;
+	/** Optional HTTP MCP servers attached to this ACP session. */
+	mcpServers?: AcpMcpServerHttp[];
 	signal?: AbortSignal;
 }
 
@@ -238,7 +247,11 @@ export class AgyAcpClient implements AcpTransport {
 		await this.ensureReady(options.signal);
 		const conn = this.requireConnection();
 		const raw = await abortable(
-			this.request("session/new", { cwd: options.cwd, mcpServers: [], ...systemPromptMeta(options) }, this.handshakeTimeoutMs),
+			this.request(
+				"session/new",
+				{ cwd: options.cwd, mcpServers: options.mcpServers ?? [], ...systemPromptMeta(options) },
+				this.handshakeTimeoutMs,
+			),
 			options.signal,
 		);
 		const parsed = parseNewSessionResult(raw);
@@ -252,7 +265,7 @@ export class AgyAcpClient implements AcpTransport {
 		const raw = await abortable(
 			this.request(
 				"session/resume",
-				{ sessionId: options.sessionId, cwd: options.cwd, mcpServers: [], ...systemPromptMeta(options) },
+				{ sessionId: options.sessionId, cwd: options.cwd, mcpServers: options.mcpServers ?? [], ...systemPromptMeta(options) },
 				this.handshakeTimeoutMs,
 			),
 			options.signal,
